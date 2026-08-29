@@ -52,7 +52,7 @@ jobs:
 
       - name: Deploy through SSM
         run: |
-          SERVICE="backend-${GITHUB_REF_NAME}"
+          SERVICE="backend"
 
           PARAMETERS=$(printf \
             '{"commands":["sudo -u ec2-user /opt/app/deploy.sh %s"]}' \
