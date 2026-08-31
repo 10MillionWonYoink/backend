@@ -29,6 +29,14 @@ async function bootstrap() {
   const configService = app.get(ConfigService);
   const port = configService.get<number>('PORT', 3000);
 
+  app.enableCors({
+    origin: [
+      'http://localhost:5173',
+      'http://10millionwonyoink-frontend-dev-586008061073-ap-northeast-2-an.s3-website.ap-northeast-2.amazonaws.com',
+    ],
+    credentials: true,
+  });
+
   await app.listen(port);
 
   console.log(`Server: http://localhost:${port}`);
