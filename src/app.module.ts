@@ -6,6 +6,7 @@ import { AppService } from './app.service';
 import { AuthModule } from './project/auth/auth.module';
 import { UsersModule } from './project/users/users.module';
 import { validate } from './config/env.validation';
+import { RoomsModule } from './project/rooms/rooms.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { validate } from './config/env.validation';
     }),
     AuthModule,
     UsersModule,
+    RoomsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
