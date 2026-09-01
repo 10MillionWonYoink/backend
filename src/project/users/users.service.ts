@@ -13,33 +13,42 @@ export class UsersService {
     private readonly usersRepository: Repository<User>,
   ) {}
   async create(createUserDto: CreateUserDto) {
-    const { email, password, name } = createUserDto;
+    const { email, password, nickname, birthDate, profileImageUrl } =
+      createUserDto;
+
+    const normalizedEmail = email.trim().toLowerCase();
 
     const existingUser = await this.usersRepository.findOne({
-      where: { email },
+      where: [{ email: normalizedEmail }, { nickname }],
     });
 
-    if (existingUser) {
+    if (existingUser?.email === normalizedEmail) {
       throw new ConflictException('이미 사용 중인 이메일입니다.');
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
+    if (existingUser?.nickname === nickname) {
+      throw new ConflictException('이미 사용 중인 닉네임입니다.');
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
 
     const user = this.usersRepository.create({
-      email,
-      password: hashedPassword,
-      name,
+      email: normalizedEmail,
+      passwordHash,
+      nickname,
+      birthDate: birthDate ?? null,
+      profileImageUrl: profileImageUrl ?? null,
     });
 
     try {
       const savedUser = await this.usersRepository.save(user);
 
-      // 비밀번호는 응답에 포함하지 않음
       return {
         id: savedUser.id,
         email: savedUser.email,
-        name: savedUser.name,
-        role: savedUser.role,
+        nickname: savedUser.nickname,
+        birthDate: savedUser.birthDate,
+        profileImageUrl: savedUser.profileImageUrl,
         createdAt: savedUser.createdAt,
         updatedAt: savedUser.updatedAt,
       };
@@ -48,7 +57,7 @@ export class UsersService {
         error instanceof QueryFailedError &&
         (error.driverError as { code?: string }).code === '23505'
       ) {
-        throw new ConflictException('이미 사용 중인 이메일입니다.');
+        throw new ConflictException('이미 사용 중인 이메일 또는 닉네임입니다.');
       }
 
       throw error;
@@ -60,8 +69,9 @@ export class UsersService {
       select: {
         id: true,
         email: true,
-        name: true,
-        role: true,
+        nickname: true,
+        birthDate: true,
+        profileImageUrl: true,
         createdAt: true,
         updatedAt: true,
       },
