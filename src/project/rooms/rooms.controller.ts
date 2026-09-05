@@ -22,11 +22,13 @@ import { ChangeRoomHostDto } from './dto/change-room-host.dto';
 export class RoomsController {
   constructor(private readonly roomsService: RoomsService) {}
 
+  // 룸 생성
   @Post()
   create(@GetUser() user: User, @Body() createRoomDto: CreateRoomDto) {
     return this.roomsService.create(user.id, createRoomDto);
   }
 
+  // 룸 탈퇴
   @Post(':roomId/leave')
   @HttpCode(200)
   leave(
@@ -39,6 +41,7 @@ export class RoomsController {
     return this.roomsService.leave(roomId, user.id);
   }
 
+  // 룸 정보 변경
   @Patch(':roomId')
   update(
     @Param('roomId', ParseIntPipe)
@@ -51,6 +54,7 @@ export class RoomsController {
     return this.roomsService.update(roomId, user.id, updateRoomDto);
   }
 
+  // 방장 변경
   @Patch(':roomId/host')
   changeHost(
     @Param('roomId', ParseIntPipe)
@@ -69,6 +73,7 @@ export class RoomsController {
     );
   }
 
+  // 방 초대
   @Get(':roomId/invite')
   getInviteLink(
     @Param('roomId', ParseIntPipe)
@@ -80,6 +85,7 @@ export class RoomsController {
     return this.roomsService.getInviteLink(roomId, user.id);
   }
 
+  // 방 참여
   @Post('invites/:inviteCode/join')
   joinByInviteCode(
     @Param('inviteCode')

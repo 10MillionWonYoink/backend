@@ -67,8 +67,8 @@ export class Room {
   @Column({ name: 'time_limit_seconds', type: 'int', default: 600 })
   timeLimitSeconds: number;
 
-  // 목표 릴레이 횟수
-  @Column({ name: 'relay_count', type: 'int', default: 10 })
+  // 한 사람 당 릴레이 횟수 (인원 * 릴레이 횟수)
+  @Column({ name: 'relay_count', type: 'int', default: 3 })
   relayCount: number;
 
   // 방 상태
