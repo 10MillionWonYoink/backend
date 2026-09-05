@@ -217,76 +217,12 @@ export class AuthService {
     });
   }
 
-  /**
-   * 가입 대기 사용자를 확인하기 위한 임시 토큰
-   */
-  async setSignupCookie(response: Response, user: User): Promise<void> {
-    const signupToken = await this.jwtService.signAsync(
-      {
-        sub: user.id,
-        purpose: 'signup',
-      },
-      {
-        secret: this.configService.getOrThrow<string>('JWT_SIGNUP_SECRET'),
-        expiresIn: '30m',
-      },
-    );
-
-    const isProduction =
-      this.configService.get<string>('NODE_ENV') === 'production';
-
-    response.cookie('signup_token', signupToken, {
-      httpOnly: true,
-      secure: isProduction,
-      sameSite: 'lax',
-      maxAge: 30 * 60 * 1000,
-    });
+  findOne(id: number) {
+    return `This action returns a #${id} auth`;
   }
 
-  /**
-   * 회원가입 완료
-   */
-  async completeSignup(
-    signupToken: string | undefined,
-    signupDto: SignupDto,
-  ): Promise<User> {
-    if (!signupToken) {
-      throw new UnauthorizedException('카카오 로그인이 필요합니다.');
-    }
-
-    let payload: SignupTokenPayload;
-
-    try {
-      payload = await this.jwtService.verifyAsync<SignupTokenPayload>(
-        signupToken,
-        {
-          secret: this.configService.getOrThrow<string>('JWT_SIGNUP_SECRET'),
-        },
-      );
-    } catch {
-      throw new UnauthorizedException('회원가입 인증이 만료되었습니다.');
-    }
-
-    if (payload.purpose !== 'signup') {
-      throw new UnauthorizedException('올바르지 않은 회원가입 토큰입니다.');
-    }
-
-    const user = await this.userRepository.findOneBy({
-      id: payload.sub,
-    });
-
-    if (!user) {
-      throw new NotFoundException('가입 대기 사용자를 찾을 수 없습니다.');
-    }
-
-    if (user.registrationCompleted) {
-      throw new ConflictException('이미 가입된 회원입니다.');
-    }
-
-    user.nickname = signupDto.nickname;
-    user.registrationCompleted = true;
-
-    return this.userRepository.save(user);
+  remove(id: number) {
+    return `This action removes a #${id} auth`;
   }
 
   async refreshLogin(refreshToken: string | undefined): Promise<User> {
