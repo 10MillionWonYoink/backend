@@ -10,8 +10,8 @@ import {
 } from 'class-validator';
 
 class EnvironmentVariables {
-  @IsIn(['dev', 'test', 'production'])
-  NODE_ENV: string = 'dev';
+  @IsIn(['development', 'test', 'production'])
+  NODE_ENV: string = 'development';
 
   @Transform(({ value }) => Number(value))
   @IsNumber()
