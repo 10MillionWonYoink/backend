@@ -49,49 +49,6 @@ export class AuthService {
     return url.toString();
   }
 
-  /**
-   * 카카오 인가 코드를 카카오 토큰으로 교환
-   */
-  async getKakaoToken(code: string) {
-    const restApiKey =
-      this.configService.getOrThrow<string>('KAKAO_REST_API_KEY');
-
-    const redirectUri =
-      this.configService.getOrThrow<string>('KAKAO_REDIRECT_URI');
-
-    const clientSecret = this.configService.get<string>('KAKAO_CLIENT_SECRET');
-
-    const body = new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: restApiKey,
-      redirect_uri: redirectUri,
-      code,
-    });
-
-    if (clientSecret) {
-      body.set('client_secret', clientSecret);
-    }
-
-    const response = await fetch('https://kauth.kakao.com/oauth/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
-      },
-      body,
-    });
-
-    if (!response.ok) {
-      const kakaoError = await response.text();
-
-      throw new BadGatewayException({
-        message: '카카오 토큰 발급에 실패했습니다.',
-        kakaoError,
-      });
-    }
-
-    return (await response.json()) as KakaoTokenResponse;
-  }
-
   async getKakaoProfile(
     kakaoAccessToken: string,
   ): Promise<KakaoProfileResponse> {
@@ -217,12 +174,119 @@ export class AuthService {
     });
   }
 
-  findOne(id: number) {
-    return `This action returns a #${id} auth`;
+  /**
+   * 카카오 인가 코드를 카카오 토큰으로 교환
+   */
+  async getKakaoToken(code: string) {
+    const restApiKey =
+      this.configService.getOrThrow<string>('KAKAO_REST_API_KEY');
+
+    const redirectUri =
+      this.configService.getOrThrow<string>('KAKAO_REDIRECT_URI');
+
+    const clientSecret = this.configService.get<string>('KAKAO_CLIENT_SECRET');
+
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: restApiKey,
+      redirect_uri: redirectUri,
+      code,
+    });
+
+    if (clientSecret) {
+      body.set('client_secret', clientSecret);
+    }
+
+    const response = await fetch('https://kauth.kakao.com/oauth/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+      },
+      body,
+    });
+
+    if (!response.ok) {
+      const kakaoError = await response.text();
+
+      throw new BadGatewayException({
+        message: '카카오 토큰 발급에 실패했습니다.',
+        kakaoError,
+      });
+    }
+
+    return (await response.json()) as KakaoTokenResponse;
   }
 
-  remove(id: number) {
-    return `This action removes a #${id} auth`;
+  /**
+   * 가입 대기 사용자를 확인하기 위한 임시 토큰
+   */
+  async setSignupCookie(response: Response, user: User): Promise<void> {
+    const signupToken = await this.jwtService.signAsync(
+      {
+        sub: user.id,
+        purpose: 'signup',
+      },
+      {
+        secret: this.configService.getOrThrow<string>('JWT_SIGNUP_SECRET'),
+        expiresIn: '30m',
+      },
+    );
+
+    const isProduction =
+      this.configService.get<string>('NODE_ENV') === 'production';
+
+    response.cookie('signup_token', signupToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      maxAge: 30 * 60 * 1000,
+    });
+  }
+
+  /**
+   * 회원가입 완료
+   */
+  async completeSignup(
+    signupToken: string | undefined,
+    signupDto: SignupDto,
+  ): Promise<User> {
+    if (!signupToken) {
+      throw new UnauthorizedException('카카오 로그인이 필요합니다.');
+    }
+
+    let payload: SignupTokenPayload;
+
+    try {
+      payload = await this.jwtService.verifyAsync<SignupTokenPayload>(
+        signupToken,
+        {
+          secret: this.configService.getOrThrow<string>('JWT_SIGNUP_SECRET'),
+        },
+      );
+    } catch {
+      throw new UnauthorizedException('회원가입 인증이 만료되었습니다.');
+    }
+
+    if (payload.purpose !== 'signup') {
+      throw new UnauthorizedException('올바르지 않은 회원가입 토큰입니다.');
+    }
+
+    const user = await this.userRepository.findOneBy({
+      id: payload.sub,
+    });
+
+    if (!user) {
+      throw new NotFoundException('가입 대기 사용자를 찾을 수 없습니다.');
+    }
+
+    if (user.registrationCompleted) {
+      throw new ConflictException('이미 가입된 회원입니다.');
+    }
+
+    user.nickname = signupDto.nickname;
+    user.registrationCompleted = true;
+
+    return this.userRepository.save(user);
   }
 
   async refreshLogin(refreshToken: string | undefined): Promise<User> {
