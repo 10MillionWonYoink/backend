@@ -6,13 +6,7 @@ import type { Request } from 'express';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { Repository } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
-
-interface JwtAccessPayload {
-  sub: number;
-  type: 'access';
-  iat?: number;
-  exp?: number;
-}
+import { AccessTokenPayload } from './jwt-payload.interface';
 
 function extractAccessTokenFromCookie(request: Request): string | null {
   const token: unknown = request.cookies?.access_token;
@@ -40,7 +34,7 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     });
   }
 
-  async validate(payload: JwtAccessPayload): Promise<User> {
+  async validate(payload: AccessTokenPayload): Promise<User> {
     if (payload.type !== 'access') {
       throw new UnauthorizedException('올바르지 않은 토큰입니다.');
     }

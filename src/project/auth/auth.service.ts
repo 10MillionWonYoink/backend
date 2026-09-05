@@ -14,7 +14,11 @@ import { User } from '../users/entities/user.entity';
 import { SignupDto } from './dto/signup.dto';
 import { KakaoTokenResponse } from './res/kakao-token-response';
 import { KakaoProfileResponse } from './res/kakao-profile-response';
-import { SignupTokenPayload } from './security/jwt-payload.interface';
+import {
+  AccessTokenPayload,
+  RefreshTokenPayload,
+  SignupTokenPayload,
+} from './security/jwt-payload.interface';
 
 @Injectable()
 export class AuthService {
@@ -172,17 +176,15 @@ export class AuthService {
     if (!user.registrationCompleted) {
       throw new UnauthorizedException('회원가입이 완료되지 않은 사용자입니다.');
     }
+    const accessPayload: AccessTokenPayload = {
+      sub: user.id,
+      type: 'access',
+    };
 
-    const accessToken = await this.jwtService.signAsync(
-      {
-        sub: user.id,
-        type: 'access',
-      },
-      {
-        secret: this.configService.getOrThrow<string>('JWT_ACCESS_SECRET'),
-        expiresIn: '15m',
-      },
-    );
+    const accessToken = await this.jwtService.signAsync(accessPayload, {
+      secret: this.configService.getOrThrow<string>('JWT_ACCESS_SECRET'),
+      expiresIn: '15m',
+    });
 
     const refreshToken = await this.jwtService.signAsync(
       {
@@ -285,5 +287,40 @@ export class AuthService {
     user.registrationCompleted = true;
 
     return this.userRepository.save(user);
+  }
+
+  async refreshLogin(refreshToken: string | undefined): Promise<User> {
+    if (!refreshToken) {
+      throw new UnauthorizedException('리프레시 토큰이 없습니다.');
+    }
+
+    let payload: RefreshTokenPayload;
+
+    try {
+      payload = await this.jwtService.verifyAsync<RefreshTokenPayload>(
+        refreshToken,
+        {
+          secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
+        },
+      );
+    } catch {
+      throw new UnauthorizedException(
+        '리프레시 토큰이 만료되었거나 올바르지 않습니다.',
+      );
+    }
+
+    if (payload.type !== 'refresh') {
+      throw new UnauthorizedException('올바르지 않은 리프레시 토큰입니다.');
+    }
+
+    const user = await this.userRepository.findOneBy({
+      id: payload.sub,
+    });
+
+    if (!user || !user.registrationCompleted) {
+      throw new UnauthorizedException('로그인할 수 없는 사용자입니다.');
+    }
+
+    return user;
   }
 }

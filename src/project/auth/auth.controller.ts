@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   Post,
   Query,
   Req,
@@ -107,5 +108,28 @@ export class AuthController {
         nickname: user.nickname,
       },
     });
+  }
+
+  @Post('refresh')
+  @HttpCode(200)
+  async refresh(
+    @Req()
+    request: ExpressRequest,
+
+    @Res({ passthrough: true })
+    response: ExpressResponse,
+  ) {
+    const token: unknown = request.cookies?.refresh_token;
+
+    const refreshToken = typeof token === 'string' ? token : undefined;
+
+    const user = await this.authService.refreshLogin(refreshToken);
+
+    // 새로운 Access·Refresh Token 발급
+    await this.authService.setLoginCookies(response, user);
+
+    return {
+      message: '토큰이 재발급되었습니다.',
+    };
   }
 }
