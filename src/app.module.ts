@@ -6,12 +6,14 @@ import { AppService } from './app.service';
 import { AuthModule } from './project/auth/auth.module';
 import { UsersModule } from './project/users/users.module';
 import { validate } from './config/env.validation';
+import { RoomsModule } from './project/rooms/rooms.module';
+import { GamesModule } from './project/games/games.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: ['.env', '.env.development.local', '.env.test.local'],
+      envFilePath: ['.env'],
       validate,
     }),
 
@@ -33,6 +35,8 @@ import { validate } from './config/env.validation';
     }),
     AuthModule,
     UsersModule,
+    RoomsModule,
+    GamesModule,
   ],
   controllers: [AppController],
   providers: [AppService],
