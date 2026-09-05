@@ -4,16 +4,19 @@ import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
 import { AppModule } from './app.module';
+import cookieParser from 'cookie-parser';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
+  app.use(cookieParser());
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
       transform: true,
     }),
   );
+  app.setGlobalPrefix('api');
 
   const swaggerConfig = new DocumentBuilder()
     .setTitle('App API')
@@ -30,10 +33,7 @@ async function bootstrap() {
   const port = configService.get<number>('PORT', 3000);
 
   app.enableCors({
-    origin: [
-      'http://localhost:5173',
-      'http://10millionwonyoink-frontend-dev-586008061073-ap-northeast-2-an.s3-website.ap-northeast-2.amazonaws.com',
-    ],
+    origin: process.env.FRONTEND_URL,
     credentials: true,
   });
 

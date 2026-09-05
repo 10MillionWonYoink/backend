@@ -9,36 +9,42 @@ import {
 
 @Entity('users')
 export class User {
-  // 사용자 ID
   @PrimaryGeneratedColumn()
   id: number;
 
-  // 이메일
+  @Column({
+    name: 'kakao_user_id',
+    type: 'varchar',
+    unique: true,
+  })
+  kakaoUserId: string;
+
   @Index({ unique: true })
   @Column({
     type: 'varchar',
     length: 255,
+    nullable: true,
   })
-  email: string;
+  email: string | null;
 
-  // 비밀번호: 평문이 아니라 암호화된 값 저장
+  // 카카오 로그인 회원은 비밀번호가 없음
   @Column({
     name: 'password_hash',
     type: 'varchar',
     length: 255,
+    nullable: true,
     select: false,
   })
-  passwordHash: string;
+  passwordHash: string | null;
 
-  // 닉네임
   @Index({ unique: true })
   @Column({
     type: 'varchar',
     length: 30,
+    nullable: true,
   })
-  nickname: string;
+  nickname: string | null;
 
-  // 생년월일
   @Column({
     name: 'birth_date',
     type: 'date',
@@ -46,7 +52,6 @@ export class User {
   })
   birthDate: string | null;
 
-  // 프로필 이미지 주소
   @Column({
     name: 'profile_image_url',
     type: 'varchar',
@@ -55,14 +60,19 @@ export class User {
   })
   profileImageUrl: string | null;
 
-  // 생성일
+  @Column({
+    name: 'registration_completed',
+    type: 'boolean',
+    default: false,
+  })
+  registrationCompleted: boolean;
+
   @CreateDateColumn({
     name: 'created_at',
     type: 'timestamptz',
   })
   createdAt: Date;
 
-  // 수정일
   @UpdateDateColumn({
     name: 'updated_at',
     type: 'timestamptz',
