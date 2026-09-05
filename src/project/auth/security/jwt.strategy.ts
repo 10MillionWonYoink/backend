@@ -29,7 +29,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     private readonly userRepository: Repository<User>,
   ) {
     super({
-      jwtFromRequest: ExtractJwt.fromExtractors([extractAccessTokenFromCookie]),
+      jwtFromRequest: ExtractJwt.fromExtractors([
+        extractAccessTokenFromCookie,
+        ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ]),
 
       secretOrKey: configService.getOrThrow<string>('JWT_ACCESS_SECRET'),
 

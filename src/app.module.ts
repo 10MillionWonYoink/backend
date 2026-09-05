@@ -7,6 +7,7 @@ import { AuthModule } from './project/auth/auth.module';
 import { UsersModule } from './project/users/users.module';
 import { validate } from './config/env.validation';
 import { RoomsModule } from './project/rooms/rooms.module';
+import { GamesModule } from './project/games/games.module';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { RoomsModule } from './project/rooms/rooms.module';
     AuthModule,
     UsersModule,
     RoomsModule,
+    GamesModule,
   ],
   controllers: [AppController],
   providers: [AppService],

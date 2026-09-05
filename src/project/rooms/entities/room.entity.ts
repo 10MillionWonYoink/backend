@@ -5,13 +5,16 @@ import {
   Index,
   JoinColumn,
   ManyToOne,
+  OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
+import { RoomMember } from './room-member.entity';
 
 export enum RoomStatus {
   WAITING = 'waiting',
+  COUNTDOWN = 'countdown',
   IN_PROGRESS = 'in_progress',
   FINISHED = 'finished',
 }
@@ -39,9 +42,17 @@ export class Room {
   @JoinColumn({ name: 'host_id' })
   host: User;
 
+  // 최소 시작 인원
+  @Column({ name: 'min_participants', type: 'int', default: 2 })
+  minParticipants: number;
+
   // 최대 인원
-  @Column({ name: 'max_participants', type: 'int', default: 10 })
+  @Column({ name: 'max_participants', type: 'int', default: 6 })
   maxParticipants: number;
+
+  // 참여자
+  @OneToMany(() => RoomMember, (roomMember) => roomMember.room)
+  members: RoomMember[];
 
   // 공개 여부
   @Column({ name: 'is_public', type: 'boolean', default: true })
@@ -49,13 +60,8 @@ export class Room {
 
   // 초대 코드
   @Index({ unique: true })
-  @Column({
-    name: 'invite_code',
-    type: 'varchar',
-    length: 20,
-    nullable: true,
-  })
-  inviteCode: string | null;
+  @Column({ name: 'invite_code', type: 'varchar', length: 20 })
+  inviteCode: string;
 
   // 한 사람에게 주어지는 제한 시간(초)
   @Column({ name: 'time_limit_seconds', type: 'int', default: 600 })
@@ -66,24 +72,14 @@ export class Room {
   relayCount: number;
 
   // 방 상태
-  @Column({
-    type: 'enum',
-    enum: RoomStatus,
-    default: RoomStatus.WAITING,
-  })
+  @Column({ type: 'enum', enum: RoomStatus, default: RoomStatus.WAITING })
   status: RoomStatus;
 
   // 생성일
-  @CreateDateColumn({
-    name: 'created_at',
-    type: 'timestamptz',
-  })
+  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
   createdAt: Date;
 
   // 수정일
-  @UpdateDateColumn({
-    name: 'updated_at',
-    type: 'timestamptz',
-  })
+  @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
   updatedAt: Date;
 }
