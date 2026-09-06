@@ -28,6 +28,12 @@ export class RoomsController {
     return this.roomsService.create(user.id, createRoomDto);
   }
 
+  // 룸 상세 조회
+  @Get(':roomId')
+  findOne(@Param('roomId', ParseIntPipe) roomId: number) {
+    return this.roomsService.findOne(roomId);
+  }
+
   // 룸 탈퇴
   @Post(':roomId/leave')
   @HttpCode(200)

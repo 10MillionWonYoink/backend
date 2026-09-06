@@ -55,6 +55,69 @@ export class RoomsService {
     });
   }
 
+  async findOne(roomId: number) {
+    const roomRepository = this.dataSource.getRepository(Room);
+    const roomMemberRepository = this.dataSource.getRepository(RoomMember);
+
+    const room = await roomRepository.findOneBy({ id: roomId });
+
+    if (!room) {
+      throw new NotFoundException('방을 찾을 수 없습니다.');
+    }
+
+    const members = await roomMemberRepository.find({
+      where: {
+        roomId,
+        leftAt: IsNull(),
+      },
+      relations: {
+        user: true,
+      },
+      select: {
+        user: {
+          id: true,
+          nickname: true,
+          profileImageUrl: true,
+        },
+      },
+      order: {
+        joinedAt: 'ASC',
+        id: 'ASC',
+      },
+    });
+
+    const players = members.map((member) => ({
+      id: member.userId,
+      nickname: member.user.nickname ?? '익명',
+      avatar: member.user.profileImageUrl,
+      isReady: member.isReady,
+      isHost: member.userId === room.hostId,
+    }));
+
+    const statusMap = {
+      [RoomStatus.WAITING]: 'WAITING',
+      [RoomStatus.COUNTDOWN]: 'READY',
+      [RoomStatus.IN_PROGRESS]: 'PLAYING',
+      [RoomStatus.FINISHED]: 'FINISHED',
+    } as const;
+
+    return {
+      room,
+      members,
+      // RoomPage에서 사용하는 표시용 필드
+      id: room.id,
+      title: room.title,
+      status: statusMap[room.status],
+      currentPlayers: players.length,
+      maxPlayers: room.maxParticipants,
+      hostName: players.find((player) => player.isHost)?.nickname ?? '익명',
+      invitationCode: room.inviteCode,
+      players,
+      turnSeconds: room.timeLimitSeconds,
+      totalRounds: room.relayCount,
+    };
+  }
+
   async leave(roomId: number, userId: number) {
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
