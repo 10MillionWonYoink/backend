@@ -1,0 +1,8 @@
+addReviewers: true
+addAssignees: false
+
+reviewers:
+  - kimsuyeon0916
+  - Chang-KY
+
+numberOfReviewers: 2
