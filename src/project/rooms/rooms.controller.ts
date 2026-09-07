@@ -22,6 +22,12 @@ import { ChangeRoomHostDto } from './dto/change-room-host.dto';
 export class RoomsController {
   constructor(private readonly roomsService: RoomsService) {}
 
+  // 참여 가능한 룸 목록 조회
+  @Get()
+  findAll() {
+    return this.roomsService.findAll();
+  }
+
   // 룸 생성
   @Post()
   create(@GetUser() user: User, @Body() createRoomDto: CreateRoomDto) {

@@ -20,6 +20,43 @@ export class RoomsService {
     private readonly configService: ConfigService,
   ) {}
 
+  async findAll() {
+    const roomRepository = this.dataSource.getRepository(Room);
+    const rooms = await roomRepository.find({
+      where: {
+        status: RoomStatus.WAITING,
+        isPublic: true,
+      },
+      relations: {
+        members: true,
+      },
+      select: {
+        id: true,
+        title: true,
+        maxParticipants: true,
+        members: {
+          id: true,
+          leftAt: true,
+        },
+      },
+      order: {
+        createdAt: 'DESC',
+        id: 'DESC',
+      },
+    });
+
+    return rooms
+      .map((room) => ({
+        id: room.id,
+        title: room.title,
+        status: 'WAITING' as const,
+        currentPlayers: room.members.filter((member) => member.leftAt === null)
+          .length,
+        maxPlayers: room.maxParticipants,
+      }))
+      .filter((room) => room.currentPlayers < room.maxPlayers);
+  }
+
   async create(userId: number, createRoomDto: CreateRoomDto) {
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
