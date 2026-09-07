@@ -8,7 +8,7 @@ import { RoomMember } from './entities/room-member.entity';
 
 describe('RoomsService', () => {
   let service: RoomsService;
-  const roomRepository = { findOneBy: jest.fn() };
+  const roomRepository = { findOneBy: jest.fn(), find: jest.fn() };
   const memberRepository = { find: jest.fn() };
 
   beforeEach(async () => {
@@ -128,5 +128,75 @@ describe('RoomsService', () => {
       new NotFoundException('방을 찾을 수 없습니다.'),
     );
     expect(memberRepository.find).not.toHaveBeenCalled();
+  });
+
+  it('returns room summaries counting only active members and excluding full rooms', async () => {
+    roomRepository.find.mockResolvedValue([
+      {
+        id: 3,
+        title: '참여 가능',
+        maxParticipants: 2,
+        members: [{ leftAt: null }, { leftAt: new Date() }],
+      },
+      {
+        id: 2,
+        title: '정원 마감',
+        maxParticipants: 2,
+        members: [{ leftAt: null }, { leftAt: null }],
+      },
+      {
+        id: 1,
+        title: '빈 방',
+        maxParticipants: 6,
+        members: [],
+      },
+    ]);
+
+    await expect(service.findAll()).resolves.toEqual([
+      {
+        id: 3,
+        title: '참여 가능',
+        status: 'WAITING',
+        currentPlayers: 1,
+        maxPlayers: 2,
+      },
+      {
+        id: 1,
+        title: '빈 방',
+        status: 'WAITING',
+        currentPlayers: 0,
+        maxPlayers: 6,
+      },
+    ]);
+    expect(roomRepository.find).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { status: RoomStatus.WAITING, isPublic: true },
+        relations: { members: true },
+        order: { createdAt: 'DESC', id: 'DESC' },
+      }),
+    );
+  });
+
+  it('returns an empty list when no public waiting rooms exist', async () => {
+    roomRepository.find.mockResolvedValue([]);
+
+    await expect(service.findAll()).resolves.toEqual([]);
+  });
+
+  it('returns an empty list when all rooms are full or over capacity', async () => {
+    roomRepository.find.mockResolvedValue([
+      {
+        id: 1,
+        maxParticipants: 2,
+        members: [{ leftAt: null }, { leftAt: null }],
+      },
+      {
+        id: 2,
+        maxParticipants: 2,
+        members: [{ leftAt: null }, { leftAt: null }, { leftAt: null }],
+      },
+    ]);
+
+    await expect(service.findAll()).resolves.toEqual([]);
   });
 });
