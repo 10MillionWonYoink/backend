@@ -29,6 +29,11 @@ interface TurnAdvanceResult {
   } | null;
 }
 
+// 서버(재)시작 시 인메모리 턴 타이머를 복구하기 위해 필요한 최소 정보.
+export type ResumableSession =
+  | { gameId: number; phase: 'countdown'; countdownEndsAt: Date }
+  | { gameId: number; phase: 'turn'; turnNumber: number; expiresAt: Date };
+
 @Injectable()
 export class GamesService {
   private readonly logger = new Logger(GamesService.name);
@@ -530,6 +535,61 @@ export class GamesService {
   }
 
   // roomId 기준 가장 최근 게임(진행 중이거나 마지막으로 끝난 게임)을 조회한다.
+  // 서버가 (재)시작될 때, 인메모리로만 관리되는 턴 타이머(RealtimeGateway.turnTimers)가
+  // 유실된 진행 중인 게임을 찾아 복구할 수 있도록 최소 정보를 반환한다.
+  // COUNTDOWN 상태면 첫 턴 시작 타이머를, IN_PROGRESS면 현재 턴의 만료 타이머를 복구해야 한다.
+  async findResumableSessions(): Promise<ResumableSession[]> {
+    const gameRepository = this.dataSource.getRepository(GameSession);
+
+    const sessions = await gameRepository.find({
+      where: [
+        { status: GameStatus.COUNTDOWN },
+        { status: GameStatus.IN_PROGRESS },
+      ],
+    });
+
+    if (sessions.length === 0) {
+      return [];
+    }
+
+    const turnRepository = this.dataSource.getRepository(GameTurn);
+
+    const resumable: ResumableSession[] = [];
+
+    for (const session of sessions) {
+      if (session.status === GameStatus.COUNTDOWN) {
+        if (session.countdownEndsAt) {
+          resumable.push({
+            gameId: session.id,
+            phase: 'countdown',
+            countdownEndsAt: session.countdownEndsAt,
+          });
+        }
+
+        continue;
+      }
+
+      const currentTurn = await turnRepository.findOneBy({
+        gameSessionId: session.id,
+        turnNumber: session.currentTurnNumber,
+      });
+
+      if (
+        currentTurn?.status === GameTurnStatus.IN_PROGRESS &&
+        currentTurn.expiresAt
+      ) {
+        resumable.push({
+          gameId: session.id,
+          phase: 'turn',
+          turnNumber: currentTurn.turnNumber,
+          expiresAt: currentTurn.expiresAt,
+        });
+      }
+    }
+
+    return resumable;
+  }
+
   async findLatestGameByRoom(roomId: number, userId: number) {
     await this.assertRoomMember(roomId, userId);
 

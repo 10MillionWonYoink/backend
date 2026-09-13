@@ -11,13 +11,14 @@ import { LobbyRealtimeHandler } from './handlers/lobby-realtime.handler';
 import { GameRealtimeHandler } from './handlers/game-realtime.handler';
 import { RealtimeAuthService } from './security/realtime-auth.service';
 import type { RealtimeSocket } from './types/realtime-socket.type';
-import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
+import { Logger, UseFilters, UsePipes, ValidationPipe } from '@nestjs/common';
 import { UpdateLobbyRoomDto } from './dto/update-lobby-room.dto';
 import { ChangeLobbyHostDto } from './dto/change-lobby-host.dto';
 import { LeaveLobbyDto } from './dto/leave-lobby.dto';
 import { StartGameDto } from './dto/start-game.dto';
 import { SubscribeGameDto } from './dto/subscribe-game.dto';
 import { SubmitGameTurnDto } from './dto/submit-game-turn.dto';
+import { WsHttpExceptionFilter } from './filters/ws-http-exception.filter';
 
 @WebSocketGateway({
   namespace: '/realtime',
@@ -27,13 +28,15 @@ import { SubmitGameTurnDto } from './dto/submit-game-turn.dto';
     credentials: true,
   },
 })
+@UseFilters(WsHttpExceptionFilter)
 export class RealtimeGateway {
   @WebSocketServer()
   server: Namespace;
 
   private readonly logger = new Logger(RealtimeGateway.name);
 
-  // gameId 별 "다음 턴 만료" 타이머. 인메모리이므로 서버가 재시작되면 유실된다.
+  // gameId 별 "다음 턴 만료"(또는 카운트다운 종료) 타이머. 인메모리이므로
+  // 서버가 재시작되면 유실된다 — afterInit()에서 진행 중인 게임의 타이머를 복구한다.
   private readonly turnTimers = new Map<number, NodeJS.Timeout>();
 
   constructor(
@@ -56,6 +59,36 @@ export class RealtimeGateway {
           next(new Error('UNAUTHORIZED'));
         });
     });
+
+    void this.resumeInFlightGameTimers();
+  }
+
+  // 서버 (재)시작 시(개발 서버 hot-reload 포함) 인메모리 타이머가 유실된
+  // 진행 중인 게임을 찾아 타이머를 다시 등록한다. 이미 만료 시각이 지났다면
+  // scheduleTurnExpiry/scheduleFirstTurn이 즉시(0ms) 실행해 정상적으로 이어서 진행된다.
+  private async resumeInFlightGameTimers(): Promise<void> {
+    try {
+      const sessions = await this.gameHandler.findResumableSessions();
+
+      for (const session of sessions) {
+        if (session.phase === 'countdown') {
+          this.scheduleFirstTurn(session.gameId, session.countdownEndsAt);
+        } else {
+          this.scheduleTurnExpiry(session.gameId, session.expiresAt);
+        }
+      }
+
+      if (sessions.length > 0) {
+        this.logger.log(
+          `서버 시작 시 진행 중이던 게임 ${sessions.length}건의 타이머를 복구했습니다.`,
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        '게임 타이머 복구 중 오류가 발생했습니다.',
+        error instanceof Error ? error.stack : error,
+      );
+    }
   }
 
   // 대기실 구독

@@ -91,7 +91,7 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
-      "node_modules/(@nestjs/(jwt|passport))/.+\\.js$": [
+      "node_modules/(@nestjs/(jwt|passport)|cookie)/.+\\.js$": [
         "ts-jest",
         {
           "tsconfig": {
@@ -102,7 +102,7 @@
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "transformIgnorePatterns": [
-      "/node_modules/(?!(@nestjs/(jwt|passport))/)"
+      "/node_modules/(?!(@nestjs/(jwt|passport)|cookie)/)"
     ],
     "collectCoverageFrom": [
       "**/*.(t|j)s"

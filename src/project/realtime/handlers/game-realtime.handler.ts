@@ -24,4 +24,8 @@ export class GameRealtimeHandler {
   async getSessionState(gameId: number, userId: number) {
     return this.gamesService.getSessionState(gameId, userId);
   }
+
+  async findResumableSessions() {
+    return this.gamesService.findResumableSessions();
+  }
 }

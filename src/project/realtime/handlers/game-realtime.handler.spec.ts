@@ -10,6 +10,7 @@ describe('GameRealtimeHandler', () => {
     submitTurn: jest.fn(),
     expireCurrentTurn: jest.fn(),
     getSessionState: jest.fn(),
+    findResumableSessions: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -55,5 +56,12 @@ describe('GameRealtimeHandler', () => {
       gameId: 1,
     });
     expect(gamesService.getSessionState).toHaveBeenCalledWith(1, 2);
+  });
+
+  it('findResumableSessions은 GamesService.findResumableSessions에 위임한다', async () => {
+    gamesService.findResumableSessions.mockResolvedValue([]);
+
+    await expect(handler.findResumableSessions()).resolves.toEqual([]);
+    expect(gamesService.findResumableSessions).toHaveBeenCalled();
   });
 });

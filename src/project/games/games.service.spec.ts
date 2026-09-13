@@ -50,6 +50,7 @@ describe('GamesService', () => {
   const gameRepository = {
     findOne: jest.fn(),
     findOneBy: jest.fn(),
+    find: jest.fn(),
     create: jest.fn((input: unknown) => input),
     save: jest.fn((input: unknown) => Promise.resolve(input)),
   };
@@ -439,6 +440,64 @@ describe('GamesService', () => {
       expect(turnRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({ status: GameTurnStatus.EXPIRED }),
       );
+    });
+  });
+
+  describe('findResumableSessions (서버 재시작 후 타이머 복구용)', () => {
+    it('진행 중인 게임이 없으면 빈 배열을 반환한다', async () => {
+      gameRepository.find.mockResolvedValue([]);
+
+      await expect(service.findResumableSessions()).resolves.toEqual([]);
+      expect(turnRepository.findOneBy).not.toHaveBeenCalled();
+    });
+
+    it('COUNTDOWN 상태 게임은 countdown 단계로 반환한다', async () => {
+      const countdownEndsAt = new Date('2026-01-01T00:00:03Z');
+      gameRepository.find.mockResolvedValue([
+        {
+          id: 1,
+          status: GameStatus.COUNTDOWN,
+          countdownEndsAt,
+          currentTurnNumber: 0,
+        },
+      ]);
+
+      await expect(service.findResumableSessions()).resolves.toEqual([
+        { gameId: 1, phase: 'countdown', countdownEndsAt },
+      ]);
+    });
+
+    it('IN_PROGRESS 상태 게임은 현재 턴의 expiresAt과 함께 turn 단계로 반환한다', async () => {
+      const expiresAt = new Date('2026-01-01T00:01:00Z');
+      gameRepository.find.mockResolvedValue([
+        { id: 2, status: GameStatus.IN_PROGRESS, currentTurnNumber: 3 },
+      ]);
+      turnRepository.findOneBy.mockResolvedValue({
+        turnNumber: 3,
+        status: GameTurnStatus.IN_PROGRESS,
+        expiresAt,
+      });
+
+      await expect(service.findResumableSessions()).resolves.toEqual([
+        { gameId: 2, phase: 'turn', turnNumber: 3, expiresAt },
+      ]);
+      expect(turnRepository.findOneBy).toHaveBeenCalledWith({
+        gameSessionId: 2,
+        turnNumber: 3,
+      });
+    });
+
+    it('현재 턴이 이미 SUBMITTED/EXPIRED로 처리된(경합) 경우는 제외한다', async () => {
+      gameRepository.find.mockResolvedValue([
+        { id: 3, status: GameStatus.IN_PROGRESS, currentTurnNumber: 1 },
+      ]);
+      turnRepository.findOneBy.mockResolvedValue({
+        turnNumber: 1,
+        status: GameTurnStatus.SUBMITTED,
+        expiresAt: new Date(),
+      });
+
+      await expect(service.findResumableSessions()).resolves.toEqual([]);
     });
   });
 
