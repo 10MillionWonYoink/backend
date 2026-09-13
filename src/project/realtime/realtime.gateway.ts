@@ -11,10 +11,13 @@ import { LobbyRealtimeHandler } from './handlers/lobby-realtime.handler';
 import { GameRealtimeHandler } from './handlers/game-realtime.handler';
 import { RealtimeAuthService } from './security/realtime-auth.service';
 import type { RealtimeSocket } from './types/realtime-socket.type';
-import { UsePipes, ValidationPipe } from '@nestjs/common';
+import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
 import { UpdateLobbyRoomDto } from './dto/update-lobby-room.dto';
 import { ChangeLobbyHostDto } from './dto/change-lobby-host.dto';
 import { LeaveLobbyDto } from './dto/leave-lobby.dto';
+import { StartGameDto } from './dto/start-game.dto';
+import { SubscribeGameDto } from './dto/subscribe-game.dto';
+import { SubmitGameTurnDto } from './dto/submit-game-turn.dto';
 
 @WebSocketGateway({
   namespace: '/realtime',
@@ -27,6 +30,11 @@ import { LeaveLobbyDto } from './dto/leave-lobby.dto';
 export class RealtimeGateway {
   @WebSocketServer()
   server: Namespace;
+
+  private readonly logger = new Logger(RealtimeGateway.name);
+
+  // gameId 별 "다음 턴 만료" 타이머. 인메모리이므로 서버가 재시작되면 유실된다.
+  private readonly turnTimers = new Map<number, NodeJS.Timeout>();
 
   constructor(
     private readonly lobbyHandler: LobbyRealtimeHandler,
@@ -232,6 +240,241 @@ export class RealtimeGateway {
       success: true,
       ...result,
     };
+  }
+
+  // 게임 시작 (방장 전용) - 대기실 구독자 전원에게 게임 시작을 알린다.
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  )
+  @SubscribeMessage('game:start')
+  async startGame(
+    @ConnectedSocket() client: RealtimeSocket,
+    @MessageBody() body: StartGameDto,
+  ) {
+    const userId = this.getUserId(client);
+    const channel = `lobby:${body.roomId}`;
+
+    this.validateChannel(client, channel);
+
+    const game = await this.gameHandler.startGame(body.roomId, userId);
+
+    this.server.to(channel).emit('lobby:game-started', {
+      roomId: game.roomId,
+      gameId: game.gameId,
+      status: game.status,
+      countdownEndsAt: game.countdownEndsAt,
+      totalTurns: game.totalTurns,
+      timeLimitSeconds: game.timeLimitSeconds,
+      turns: game.turns,
+    });
+
+    this.scheduleFirstTurn(game.gameId, game.countdownEndsAt);
+
+    return {
+      success: true,
+      ...game,
+    };
+  }
+
+  // 게임 진행 화면 구독 - 현재 세션/턴 상태를 전달한다.
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  )
+  @SubscribeMessage('game:subscribe')
+  async subscribeGame(
+    @ConnectedSocket() client: RealtimeSocket,
+    @MessageBody() body: SubscribeGameDto,
+  ) {
+    const userId = this.getUserId(client);
+
+    const state = await this.gameHandler.getSessionState(body.gameId, userId);
+
+    await this.moveChannel(client, this.gameChannel(body.gameId));
+
+    client.emit('game:state', state);
+
+    return {
+      success: true,
+      gameId: body.gameId,
+    };
+  }
+
+  // 사진 제출 및 턴 진행
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  )
+  @SubscribeMessage('game:turn:submit')
+  async submitTurn(
+    @ConnectedSocket() client: RealtimeSocket,
+    @MessageBody() body: SubmitGameTurnDto,
+  ) {
+    const userId = this.getUserId(client);
+    const channel = this.gameChannel(body.gameId);
+
+    this.validateChannel(client, channel);
+
+    const result = await this.gameHandler.submitTurn(
+      body.gameId,
+      userId,
+      body.imageKey,
+    );
+
+    this.clearTurnTimer(body.gameId);
+
+    this.server.to(channel).emit('game:turn-submitted', {
+      gameId: result.gameId,
+      roomId: result.roomId,
+      submittedTurn: result.submittedTurn,
+    });
+
+    this.handleTurnAdvance(channel, result);
+
+    return {
+      success: true,
+      ...result,
+    };
+  }
+
+  // 카운트다운 종료 후 첫 턴을 시작한다.
+  private scheduleFirstTurn(gameId: number, countdownEndsAt: Date): void {
+    const delay = Math.max(0, countdownEndsAt.getTime() - Date.now());
+
+    setTimeout(() => {
+      void this.beginFirstTurn(gameId);
+    }, delay);
+  }
+
+  private async beginFirstTurn(gameId: number): Promise<void> {
+    try {
+      const result = await this.gameHandler.beginFirstTurn(gameId);
+
+      // 이미 시작되었거나(경합) 게임을 찾을 수 없는 경우
+      if (!result) {
+        return;
+      }
+
+      const channel = this.gameChannel(gameId);
+
+      this.server.to(channel).emit('game:turn-started', {
+        gameId: result.gameId,
+        roomId: result.roomId,
+        turnNumber: result.turnNumber,
+        userId: result.userId,
+        startedAt: result.startedAt,
+        expiresAt: result.expiresAt,
+      });
+
+      this.scheduleTurnExpiry(gameId, result.expiresAt);
+    } catch (error) {
+      this.logger.error(
+        `게임(${gameId}) 첫 턴 시작 처리 실패`,
+        error instanceof Error ? error.stack : error,
+      );
+    }
+  }
+
+  // 제한 시간이 지나도록 제출하지 않으면 자동으로 턴을 만료시키고 다음 턴으로 진행한다.
+  private scheduleTurnExpiry(gameId: number, expiresAt: Date): void {
+    this.clearTurnTimer(gameId);
+
+    const delay = Math.max(0, expiresAt.getTime() - Date.now());
+
+    const timer = setTimeout(() => {
+      void this.expireCurrentTurn(gameId);
+    }, delay);
+
+    this.turnTimers.set(gameId, timer);
+  }
+
+  private async expireCurrentTurn(gameId: number): Promise<void> {
+    try {
+      const result = await this.gameHandler.expireCurrentTurn(gameId);
+
+      // 이미 제출되었거나(경합) 진행 중인 게임이 아닌 경우
+      if (!result) {
+        this.turnTimers.delete(gameId);
+        return;
+      }
+
+      const channel = this.gameChannel(gameId);
+
+      this.server.to(channel).emit('game:turn-expired', {
+        gameId: result.gameId,
+        roomId: result.roomId,
+        expiredTurn: result.expiredTurn,
+      });
+
+      this.handleTurnAdvance(channel, result);
+    } catch (error) {
+      this.turnTimers.delete(gameId);
+
+      this.logger.error(
+        `게임(${gameId}) 턴 만료 처리 실패`,
+        error instanceof Error ? error.stack : error,
+      );
+    }
+  }
+
+  // 제출/만료 이후 다음 턴 시작 또는 게임 종료를 방송한다.
+  private handleTurnAdvance(
+    channel: string,
+    result: {
+      finished: boolean;
+      gameId: number;
+      roomId: number;
+      nextTurn: {
+        turnNumber: number;
+        userId: number;
+        startedAt: Date;
+        expiresAt: Date;
+      } | null;
+    },
+  ): void {
+    if (result.finished) {
+      this.clearTurnTimer(result.gameId);
+
+      this.server.to(channel).emit('game:finished', {
+        gameId: result.gameId,
+        roomId: result.roomId,
+      });
+
+      return;
+    }
+
+    if (result.nextTurn) {
+      this.server.to(channel).emit('game:turn-started', {
+        gameId: result.gameId,
+        roomId: result.roomId,
+        turnNumber: result.nextTurn.turnNumber,
+        userId: result.nextTurn.userId,
+        startedAt: result.nextTurn.startedAt,
+        expiresAt: result.nextTurn.expiresAt,
+      });
+
+      this.scheduleTurnExpiry(result.gameId, result.nextTurn.expiresAt);
+    }
+  }
+
+  private clearTurnTimer(gameId: number): void {
+    const timer = this.turnTimers.get(gameId);
+
+    if (timer) {
+      clearTimeout(timer);
+      this.turnTimers.delete(gameId);
+    }
+  }
+
+  private gameChannel(gameId: number): string {
+    return `game:${gameId}`;
   }
 
   private async moveChannel(
