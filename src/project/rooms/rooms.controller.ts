@@ -8,6 +8,7 @@ import {
   ParseIntPipe,
   HttpCode,
   Get,
+  Req,
 } from '@nestjs/common';
 import { RoomsService } from './rooms.service';
 import { CreateRoomDto } from './dto/create-room.dto';
@@ -16,6 +17,7 @@ import { GetUser } from '../auth/security/get-user.decorator';
 import { User } from '../users/entities/user.entity';
 import { UpdateRoomDto } from './dto/update-room.dto';
 import { ChangeRoomHostDto } from './dto/change-room-host.dto';
+import { AccessTokenPayload } from '../auth/security/jwt-payload.interface';
 
 @Controller('rooms')
 @UseGuards(JwtAuthGuard)
@@ -26,6 +28,17 @@ export class RoomsController {
   @Get()
   findAll() {
     return this.roomsService.findAll();
+  }
+
+  // 내가 참여한 룸 목록 조회
+  @Get('my')
+  findMyRoomList(
+    @Req()
+    req: Request & {
+      user: AccessTokenPayload;
+    },
+  ) {
+    return this.roomsService.findMyAll(req.user.sub);
   }
 
   // 룸 생성
@@ -50,39 +63,7 @@ export class RoomsController {
     @GetUser()
     user: User,
   ) {
-    return this.roomsService.leave(roomId, user.id);
-  }
-
-  // 룸 정보 변경
-  @Patch(':roomId')
-  update(
-    @Param('roomId', ParseIntPipe)
-    roomId: number,
-    @GetUser()
-    user: User,
-    @Body()
-    updateRoomDto: UpdateRoomDto,
-  ) {
-    return this.roomsService.update(roomId, user.id, updateRoomDto);
-  }
-
-  // 방장 변경
-  @Patch(':roomId/host')
-  changeHost(
-    @Param('roomId', ParseIntPipe)
-    roomId: number,
-
-    @GetUser()
-    user: User,
-
-    @Body()
-    changeRoomHostDto: ChangeRoomHostDto,
-  ) {
-    return this.roomsService.changeHost(
-      roomId,
-      user.id,
-      changeRoomHostDto.newHostUserId,
-    );
+    return this.roomsService.leaveRoom(roomId, user.id);
   }
 
   // 방 초대

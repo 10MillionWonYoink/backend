@@ -9,7 +9,7 @@ import { GetUser } from '../auth/security/get-user.decorator';
 import { User } from '../users/entities/user.entity';
 import { GamesService } from './games.service';
 import { JwtAuthGuard } from '../auth/security/jwt-auth-guard';
-import { GamesGateway } from './games/games.gateway';
+import { GamesGateway } from './gateway/games.gateway';
 
 @Controller()
 @UseGuards(JwtAuthGuard)
@@ -19,7 +19,7 @@ export class GamesController {
     private readonly gamesGateway: GamesGateway,
   ) {}
 
-  @Post('rooms/:roomId/games')
+  @Post('rooms/:roomId/gateway')
   async startGame(
     @Param('roomId', ParseIntPipe)
     roomId: number,
