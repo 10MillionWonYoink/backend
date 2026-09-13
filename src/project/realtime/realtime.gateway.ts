@@ -57,12 +57,16 @@ export class RealtimeGateway {
     @MessageBody() body: { roomId: number },
   ) {
     const userId = this.getUserId(client);
+    const channel = `lobby:${body.roomId}`;
 
-    const state = await this.lobbyHandler.subscribe(body.roomId, userId);
+    // 구독 사용자 한 명의 정보 조회
+    const joinedMember = await this.lobbyHandler.subscribe(body.roomId, userId);
 
-    await this.moveChannel(client, `lobby:${body.roomId}`);
+    // Socket.IO 채널 참여
+    await this.moveChannel(client, channel);
 
-    client.emit('lobby:state', state);
+    // 새 사용자 본인을 제외한 기존 사용자에게 전송
+    client.to(channel).emit('lobby:member-joined', joinedMember);
 
     return {
       success: true,

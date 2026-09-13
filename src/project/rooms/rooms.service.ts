@@ -57,34 +57,6 @@ export class RoomsService {
       .filter((room) => room.currentPlayers < room.maxPlayers);
   }
 
-  async findMyAll(userId: number) {
-    const roomRepository = this.dataSource.getRepository(Room);
-
-    const rooms = await roomRepository
-      .createQueryBuilder('room')
-      .innerJoin(
-        'room.members',
-        'myMember',
-        `
-        myMember.userId = :userId
-        AND myMember.leftAt IS NULL
-      `,
-        { userId },
-      )
-      .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
-      .orderBy('room.createdAt', 'DESC')
-      .addOrderBy('room.id', 'DESC')
-      .getMany();
-
-    return rooms.map((room) => ({
-      id: room.id,
-      title: room.title,
-      status: room.status,
-      currentPlayers: room.members.length,
-      maxPlayers: room.maxParticipants,
-    }));
-  }
-
   async create(userId: number, createRoomDto: CreateRoomDto) {
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
@@ -120,66 +92,73 @@ export class RoomsService {
     });
   }
 
-  async findOne(roomId: number) {
+  async findOne(roomId: number, userId: number) {
     const roomRepository = this.dataSource.getRepository(Room);
-    const roomMemberRepository = this.dataSource.getRepository(RoomMember);
 
-    const room = await roomRepository.findOneBy({ id: roomId });
+    const room = await roomRepository
+      .createQueryBuilder('room')
+
+      // 요청한 사용자가 현재 방 참여자인지 검증
+      .innerJoin(
+        'room.members',
+        'myMembership',
+        `
+        myMembership.userId = :userId
+        AND myMembership.leftAt IS NULL
+      `,
+        { userId },
+      )
+
+      // 현재 방의 활성 참여자 조회
+      .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
+      .leftJoinAndSelect('members.user', 'memberUser')
+
+      .where('room.id = :roomId', {
+        roomId,
+      })
+      .andWhere('room.status IN (:...statuses)', {
+        statuses: [RoomStatus.WAITING, RoomStatus.COUNTDOWN],
+      })
+      .orderBy('members.joinedAt', 'ASC')
+      .addOrderBy('members.id', 'ASC')
+      .getOne();
 
     if (!room) {
-      throw new NotFoundException('방을 찾을 수 없습니다.');
+      throw new ForbiddenException('참여 중인 대기실이 아닙니다.');
     }
 
-    const members = await roomMemberRepository.find({
-      where: {
-        roomId,
-        leftAt: IsNull(),
-      },
-      relations: {
-        user: true,
-      },
-      select: {
-        user: {
-          id: true,
-          nickname: true,
-          profileImageUrl: true,
-        },
-      },
-      order: {
-        joinedAt: 'ASC',
-        id: 'ASC',
-      },
-    });
-
-    const players = members.map((member) => ({
-      id: member.userId,
+    const players = room.members.map((member) => ({
+      memberId: member.id,
+      userId: member.userId,
       nickname: member.user.nickname ?? '익명',
-      avatar: member.user.profileImageUrl,
+      profileImageUrl: member.user.profileImageUrl,
       isReady: member.isReady,
       isHost: member.userId === room.hostId,
     }));
 
-    const statusMap = {
-      [RoomStatus.WAITING]: 'WAITING',
-      [RoomStatus.COUNTDOWN]: 'READY',
-      [RoomStatus.IN_PROGRESS]: 'PLAYING',
-      [RoomStatus.FINISHED]: 'FINISHED',
-    } as const;
+    const host = players.find((player) => player.isHost);
 
     return {
-      room,
-      members,
-      // RoomPage에서 사용하는 표시용 필드
       id: room.id,
       title: room.title,
-      status: statusMap[room.status],
-      currentPlayers: players.length,
+      status: room.status,
+
+      hostId: room.hostId,
+      hostName: host?.nickname ?? '익명',
+
+      minPlayers: room.minParticipants,
       maxPlayers: room.maxParticipants,
-      hostName: players.find((player) => player.isHost)?.nickname ?? '익명',
+      currentPlayers: players.length,
+
+      isPublic: room.isPublic,
       invitationCode: room.inviteCode,
-      players,
+
       turnSeconds: room.timeLimitSeconds,
       totalRounds: room.relayCount,
+
+      players,
+
+      updatedAt: room.updatedAt,
     };
   }
 
@@ -635,77 +614,49 @@ export class RoomsService {
     };
   }
 
-  async findLobbyStateForMember(roomId: number, userId: number) {
-    const roomRepository = this.dataSource.getRepository(Room);
+  async findActiveMember(roomId: number, userId: number) {
+    const memberRepository = this.dataSource.getRepository(RoomMember);
 
-    const room = await roomRepository
-      .createQueryBuilder('room')
-
-      // 현재 사용자가 실제 참여자인지 확인
-      .innerJoin(
-        'room.members',
-        'myMembership',
-        `
-        myMembership.userId = :userId
-        AND myMembership.leftAt IS NULL
-      `,
-        { userId },
-      )
-
-      // 방장 정보
-      .leftJoinAndSelect('room.host', 'host')
-
-      // 방의 전체 활성 참여자
-      .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
-      .leftJoinAndSelect('members.user', 'memberUser')
-
-      .where('room.id = :roomId', {
+    const member = await memberRepository.findOne({
+      where: {
         roomId,
-      })
-      .andWhere('room.status IN (:...statuses)', {
-        statuses: [RoomStatus.WAITING, RoomStatus.COUNTDOWN],
-      })
-      .getOne();
+        userId,
+        leftAt: IsNull(),
+      },
+      relations: {
+        user: true,
+        room: true,
+      },
+      select: {
+        id: true,
+        userId: true,
+        isReady: true,
+        joinedAt: true,
 
-    if (!room) {
-      throw new ForbiddenException('참여 중인 대기실이 아닙니다.');
+        user: {
+          id: true,
+          nickname: true,
+          profileImageUrl: true,
+        },
+
+        room: {
+          id: true,
+          hostId: true,
+        },
+      },
+    });
+
+    if (!member) {
+      throw new ForbiddenException('현재 방에 참여 중인 사용자가 아닙니다.');
     }
 
-    const members = room.members.sort(
-      (a, b) => a.joinedAt.getTime() - b.joinedAt.getTime(),
-    );
-
     return {
-      id: room.id,
-      title: room.title,
-      status: room.status,
-
-      hostId: room.hostId,
-
-      host: {
-        id: room.host.id,
-        nickname: room.host.nickname,
-        profileImageUrl: room.host.profileImageUrl,
-      },
-
-      minParticipants: room.minParticipants,
-      maxParticipants: room.maxParticipants,
-      currentParticipants: members.length,
-
-      isPublic: room.isPublic,
-      inviteCode: room.inviteCode,
-      relayCount: room.relayCount,
-      timeLimitSeconds: room.timeLimitSeconds,
-
-      members: members.map((member) => ({
-        memberId: member.id,
-        userId: member.userId,
-        nickname: member.user.nickname,
-        profileImageUrl: member.user.profileImageUrl,
-        isReady: member.isReady,
-        isHost: member.userId === room.hostId,
-        joinedAt: member.joinedAt,
-      })),
+      memberId: member.id,
+      userId: member.userId,
+      nickname: member.user.nickname ?? '익명',
+      profileImageUrl: member.user.profileImageUrl,
+      isReady: member.isReady,
+      isHost: member.room.hostId === member.userId,
     };
   }
 }

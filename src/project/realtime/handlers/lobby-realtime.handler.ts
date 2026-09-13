@@ -11,7 +11,7 @@ export class LobbyRealtimeHandler {
   ) {}
 
   async subscribe(roomId: number, userId: number) {
-    return this.roomsService.findLobbyStateForMember(roomId, userId);
+    return this.roomsService.findActiveMember(roomId, userId);
   }
 
   async changeReady(roomId: number, userId: number, isReady: boolean) {

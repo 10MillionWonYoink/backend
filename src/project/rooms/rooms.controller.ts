@@ -26,12 +26,6 @@ export class RoomsController {
     return this.roomsService.findAll();
   }
 
-  // 내가 참여했던 룸 목록 조회
-  @Get('my')
-  findMyRoomList(@GetUser() user: User) {
-    return this.roomsService.findMyAll(user.id);
-  }
-
   // 룸 생성
   @Post()
   create(@GetUser() user: User, @Body() createRoomDto: CreateRoomDto) {
@@ -40,8 +34,11 @@ export class RoomsController {
 
   // 룸 상세 조회
   @Get(':roomId')
-  findOne(@Param('roomId', ParseIntPipe) roomId: number) {
-    return this.roomsService.findOne(roomId);
+  findOne(
+    @Param('roomId', ParseIntPipe) roomId: number,
+    @GetUser() user: User,
+  ) {
+    return this.roomsService.findOne(roomId, user.id);
   }
 
   // 룸 참여
