@@ -97,12 +97,13 @@ export class GamesService {
       });
 
       const countdownEndsAt = new Date(Date.now() + 3_000);
+      const totalTurns = members.length * room.relayCount;
 
       const game = gameRepository.create({
         roomId: room.id,
         status: GameStatus.COUNTDOWN,
         currentTurnNumber: 0,
-        totalTurns: room.relayCount,
+        totalTurns,
         timeLimitSeconds: room.timeLimitSeconds,
         initialImageKey: null,
         countdownEndsAt,
@@ -121,8 +122,6 @@ export class GamesService {
        * A → B → C
        * A → B → C
        */
-      const totalTurns = members.length * room.relayCount;
-
       const turns = Array.from(
         {
           length: totalTurns,

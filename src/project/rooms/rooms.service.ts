@@ -144,9 +144,6 @@ export class RoomsService {
       .where('room.id = :roomId', {
         roomId,
       })
-      .andWhere('room.status IN (:...statuses)', {
-        statuses: [RoomStatus.WAITING, RoomStatus.COUNTDOWN],
-      })
       .orderBy('members.joinedAt', 'ASC')
       .addOrderBy('members.id', 'ASC')
       .getOne();

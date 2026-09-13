@@ -55,7 +55,7 @@ export class GameSession {
   })
   currentTurnNumber: number;
 
-  // 게임 시작 시 Room.relayCount를 복사
+  // 게임 시작 시 생성되는 전체 턴 수
   @Column({
     name: 'total_turns',
     type: 'int',

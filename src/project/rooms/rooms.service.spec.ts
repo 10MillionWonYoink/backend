@@ -1,18 +1,39 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
+import { ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DataSource, IsNull } from 'typeorm';
+import { DataSource } from 'typeorm';
 import { RoomsService } from './rooms.service';
 import { Room, RoomStatus } from './entities/room.entity';
 import { RoomMember } from './entities/room-member.entity';
 
 describe('RoomsService', () => {
   let service: RoomsService;
-  const roomRepository = { findOneBy: jest.fn(), find: jest.fn() };
+  const queryBuilder = {
+    innerJoin: jest.fn(),
+    leftJoinAndSelect: jest.fn(),
+    where: jest.fn(),
+    andWhere: jest.fn(),
+    orderBy: jest.fn(),
+    addOrderBy: jest.fn(),
+    getOne: jest.fn(),
+  };
+  const roomRepository = {
+    createQueryBuilder: jest.fn(),
+    findOneBy: jest.fn(),
+    find: jest.fn(),
+  };
   const memberRepository = { find: jest.fn() };
 
   beforeEach(async () => {
     jest.resetAllMocks();
+    queryBuilder.innerJoin.mockReturnValue(queryBuilder);
+    queryBuilder.leftJoinAndSelect.mockReturnValue(queryBuilder);
+    queryBuilder.where.mockReturnValue(queryBuilder);
+    queryBuilder.andWhere.mockReturnValue(queryBuilder);
+    queryBuilder.orderBy.mockReturnValue(queryBuilder);
+    queryBuilder.addOrderBy.mockReturnValue(queryBuilder);
+    roomRepository.createQueryBuilder.mockReturnValue(queryBuilder);
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         RoomsService,
@@ -30,104 +51,106 @@ describe('RoomsService', () => {
     service = module.get<RoomsService>(RoomsService);
   });
 
-  it('returns room and active members with display profiles in creation response format', async () => {
+  it('활성 참여자에게 게임 진행 상태의 방 상세를 반환한다', async () => {
+    const updatedAt = new Date('2026-09-13T00:00:00Z');
     const room = {
       id: 12,
       title: '테스트 방',
       hostId: 3,
-      status: RoomStatus.WAITING,
+      status: RoomStatus.IN_PROGRESS,
+      minParticipants: 2,
       maxParticipants: 6,
+      isPublic: false,
       inviteCode: 'room-invite',
       timeLimitSeconds: 600,
       relayCount: 3,
+      updatedAt,
+      members: [
+        {
+          id: 1,
+          userId: 3,
+          isReady: false,
+          user: { nickname: '방장', profileImageUrl: null },
+        },
+        {
+          id: 2,
+          userId: 7,
+          isReady: true,
+          user: { nickname: '참여자', profileImageUrl: '/avatar.png' },
+        },
+      ],
     };
-    const members = [
-      {
-        id: 1,
-        roomId: 12,
-        userId: 3,
-        isReady: false,
-        leftAt: null,
-        user: { id: 3, nickname: '방장', profileImageUrl: null },
-      },
-      {
-        id: 2,
-        roomId: 12,
-        userId: 7,
-        isReady: true,
-        leftAt: null,
-        user: { id: 7, nickname: '참여자', profileImageUrl: '/avatar.png' },
-      },
-    ];
-    roomRepository.findOneBy.mockResolvedValue(room);
-    memberRepository.find.mockResolvedValue(members);
+    queryBuilder.getOne.mockResolvedValue(room);
 
-    await expect(service.findOne(12)).resolves.toEqual({
-      room,
-      members,
+    await expect(service.findOne(12, 3)).resolves.toEqual({
       id: 12,
       title: '테스트 방',
-      status: 'WAITING',
-      currentPlayers: 2,
-      maxPlayers: 6,
+      status: RoomStatus.IN_PROGRESS,
+      hostId: 3,
       hostName: '방장',
+      minPlayers: 2,
+      maxPlayers: 6,
+      currentPlayers: 2,
+      isPublic: false,
       invitationCode: 'room-invite',
       players: [
-        { id: 3, nickname: '방장', avatar: null, isReady: false, isHost: true },
         {
-          id: 7,
+          memberId: 1,
+          userId: 3,
+          nickname: '방장',
+          profileImageUrl: null,
+          isReady: false,
+          isHost: true,
+        },
+        {
+          memberId: 2,
+          userId: 7,
           nickname: '참여자',
-          avatar: '/avatar.png',
+          profileImageUrl: '/avatar.png',
           isReady: true,
           isHost: false,
         },
       ],
       turnSeconds: 600,
       totalRounds: 3,
+      updatedAt,
     });
-    expect(roomRepository.findOneBy).toHaveBeenCalledWith({ id: 12 });
-    expect(memberRepository.find).toHaveBeenCalledWith({
-      where: { roomId: 12, leftAt: IsNull() },
-      relations: { user: true },
-      select: { user: { id: true, nickname: true, profileImageUrl: true } },
-      order: { joinedAt: 'ASC', id: 'ASC' },
+    expect(queryBuilder.innerJoin).toHaveBeenCalledWith(
+      'room.members',
+      'myMembership',
+      expect.stringContaining('myMembership.leftAt IS NULL'),
+      { userId: 3 },
+    );
+    expect(queryBuilder.where).toHaveBeenCalledWith('room.id = :roomId', {
+      roomId: 12,
     });
-  });
-
-  it('returns an empty member list for an existing room without active members', async () => {
-    const room = { id: 12, title: '테스트 방' };
-    roomRepository.findOneBy.mockResolvedValue(room);
-    memberRepository.find.mockResolvedValue([]);
-
-    await expect(service.findOne(12)).resolves.toMatchObject({
-      room,
-      members: [],
-      players: [],
-      currentPlayers: 0,
-    });
+    expect(queryBuilder.andWhere).not.toHaveBeenCalled();
   });
 
   it.each([
-    [RoomStatus.WAITING, 'WAITING'],
-    [RoomStatus.COUNTDOWN, 'READY'],
-    [RoomStatus.IN_PROGRESS, 'PLAYING'],
-    [RoomStatus.FINISHED, 'FINISHED'],
-  ])('maps %s to RoomPage status %s', async (status, expectedStatus) => {
-    roomRepository.findOneBy.mockResolvedValue({ id: 12, status });
-    memberRepository.find.mockResolvedValue([]);
-
-    await expect(service.findOne(12)).resolves.toMatchObject({
-      status: expectedStatus,
+    RoomStatus.WAITING,
+    RoomStatus.COUNTDOWN,
+    RoomStatus.IN_PROGRESS,
+    RoomStatus.FINISHED,
+  ])('%s 상태의 활성 참여자도 방 상세를 조회할 수 있다', async (status) => {
+    queryBuilder.getOne.mockResolvedValue({
+      id: 12,
+      status,
+      members: [],
     });
+
+    await expect(service.findOne(12, 3)).resolves.toMatchObject({
+      status,
+    });
+    expect(queryBuilder.andWhere).not.toHaveBeenCalled();
   });
 
-  it('throws 404 when the room does not exist', async () => {
-    roomRepository.findOneBy.mockResolvedValue(null);
+  it('활성 참여자가 아니면 방 상세 조회를 거부한다', async () => {
+    queryBuilder.getOne.mockResolvedValue(null);
 
-    await expect(service.findOne(999)).rejects.toThrow(
-      new NotFoundException('방을 찾을 수 없습니다.'),
+    await expect(service.findOne(999, 3)).rejects.toThrow(
+      new ForbiddenException('참여 중인 대기실이 아닙니다.'),
     );
-    expect(memberRepository.find).not.toHaveBeenCalled();
   });
 
   it('returns room summaries counting only active members and excluding full rooms', async () => {

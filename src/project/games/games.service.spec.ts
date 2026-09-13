@@ -135,6 +135,9 @@ describe('GamesService', () => {
       expect(result.status).toBe(GameStatus.COUNTDOWN);
       expect(result.totalTurns).toBe(4); // 2명 * relayCount(2)
       expect(result.turns.map((turn) => turn.userId)).toEqual([10, 11, 10, 11]);
+      expect(gameRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ totalTurns: 4 }),
+      );
       expect(roomRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({ status: RoomStatus.COUNTDOWN }),
       );
