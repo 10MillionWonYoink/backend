@@ -57,6 +57,34 @@ export class RoomsService {
       .filter((room) => room.currentPlayers < room.maxPlayers);
   }
 
+  async findMyAll(userId: number) {
+    const roomRepository = this.dataSource.getRepository(Room);
+
+    const rooms = await roomRepository
+      .createQueryBuilder('room')
+      .innerJoin(
+        'room.members',
+        'myMember',
+        `
+        myMember.userId = :userId
+        AND myMember.leftAt IS NULL
+      `,
+        { userId },
+      )
+      .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
+      .orderBy('room.createdAt', 'DESC')
+      .addOrderBy('room.id', 'DESC')
+      .getMany();
+
+    return rooms.map((room) => ({
+      id: room.id,
+      title: room.title,
+      status: room.status,
+      currentPlayers: room.members.length,
+      maxPlayers: room.maxParticipants,
+    }));
+  }
+
   async create(userId: number, createRoomDto: CreateRoomDto) {
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
@@ -155,13 +183,13 @@ export class RoomsService {
     };
   }
 
-  async leave(roomId: number, userId: number) {
+  async leaveRoom(roomId: number, userId: number) {
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
 
-      const roomMemberRepository = manager.getRepository(RoomMember);
+      const memberRepository = manager.getRepository(RoomMember);
 
-      // 동일한 방에서 동시에 탈퇴·방장 변경이 발생하지 않도록 잠금
+      // 동시에 방장 변경이나 다른 퇴장이 발생하지 않도록 잠금
       const room = await roomRepository.findOne({
         where: {
           id: roomId,
@@ -174,73 +202,82 @@ export class RoomsService {
       if (!room) {
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
+
       if (room.status !== RoomStatus.WAITING) {
-        throw new ConflictException(
-          '게임 대기 중에만 방에서 나갈 수 있습니다.',
-        );
+        throw new ConflictException('대기 중인 방에서만 나갈 수 있습니다.');
       }
-      const member = await roomMemberRepository.findOne({
+
+      const leavingMember = await memberRepository.findOne({
         where: {
           roomId,
           userId,
           leftAt: IsNull(),
         },
+        lock: {
+          mode: 'pessimistic_write',
+        },
       });
 
-      if (!member) {
-        throw new NotFoundException('현재 방에 참여 중인 사용자가 아닙니다.');
+      if (!leavingMember) {
+        throw new BadRequestException('현재 방에 참여 중인 사용자가 아닙니다.');
       }
 
-      // 나가는 사용자를 제외한 활성 멤버
-      const remainingMembers = await roomMemberRepository.find({
-        where: {
+      // 실제 삭제 대신 퇴장 시간 기록
+      leavingMember.leftAt = new Date();
+      leavingMember.isReady = false;
+      leavingMember.turnOrder = null;
+
+      await memberRepository.save(leavingMember);
+
+      // 퇴장한 사용자를 제외한 나머지 활성 참여자
+      const remainingMembers = await memberRepository
+        .createQueryBuilder('member')
+        .where('member.roomId = :roomId', {
           roomId,
-          userId: Not(userId),
-          leftAt: IsNull(),
-        },
-        order: {
-          joinedAt: 'ASC',
-          id: 'ASC',
-        },
-      });
+        })
+        .andWhere('member.leftAt IS NULL')
+        .orderBy('member.joinedAt', 'ASC')
+        .addOrderBy('member.id', 'ASC')
+        .setLock('pessimistic_write')
+        .getMany();
 
-      const isHost = room.hostId === userId;
-
-      // 방장 혼자 남아 있던 경우 방 삭제
-      if (isHost && remainingMembers.length === 0) {
+      // 남은 사람이 없으면 방 삭제
+      if (remainingMembers.length === 0) {
         await roomRepository.remove(room);
 
         return {
-          message: '방이 삭제되었습니다.',
           roomId,
+          leftUserId: userId,
+          currentParticipants: 0,
           roomDeleted: true,
+          hostChanged: false,
+          previousHostId: null,
           newHostId: null,
         };
       }
 
-      // 탈퇴 상태 기록
-      member.leftAt = new Date();
-      member.isReady = false;
-      member.turnOrder = null;
-
-      await roomMemberRepository.save(member);
-
+      let previousHostId: number | null = null;
       let newHostId: number | null = null;
 
-      // 방장이 나가면 가장 먼저 들어온 멤버에게 방장 위임
-      if (isHost) {
-        const nextHost = remainingMembers[0];
+      // 나가는 사람이 방장이면 가장 먼저 입장한 사람에게 이전
+      if (room.hostId === userId) {
+        const newHost = remainingMembers[0];
 
-        room.hostId = nextHost.userId;
-        newHostId = nextHost.userId;
+        previousHostId = room.hostId;
+        newHostId = newHost.userId;
+
+        room.hostId = newHost.userId;
 
         await roomRepository.save(room);
       }
 
       return {
-        message: '방에서 나갔습니다.',
         roomId,
+        leftUserId: userId,
+        currentParticipants: remainingMembers.length,
         roomDeleted: false,
+        hostChanged: newHostId !== null,
+        previousHostId,
         newHostId,
       };
     });
@@ -368,6 +405,9 @@ export class RoomsService {
           userId: newHostUserId,
           leftAt: IsNull(),
         },
+        lock: {
+          mode: 'pessimistic_write',
+        },
       });
 
       if (!newHostMember) {
@@ -383,13 +423,14 @@ export class RoomsService {
       await roomRepository.save(room);
 
       return {
-        message: '방장이 변경되었습니다.',
         roomId,
         previousHostId,
         newHostId: newHostUserId,
+        message: '방장이 변경되었습니다.',
       };
     });
   }
+
   async getInviteLink(roomId: number, userId: number) {
     const roomRepository = this.dataSource.getRepository(Room);
 
@@ -515,5 +556,104 @@ export class RoomsService {
 
   private generateInviteCode(): string {
     return randomBytes(8).toString('hex');
+  }
+
+  async updateReady(roomId: number, userId: number, isReady: boolean) {
+    const memberRepository = this.dataSource.getRepository(RoomMember);
+
+    const result = await memberRepository.update(
+      {
+        roomId,
+        userId,
+        leftAt: IsNull(),
+      },
+      {
+        isReady,
+      },
+    );
+
+    if (result.affected === 0) {
+      throw new NotFoundException('현재 참여 중인 사용자가 아닙니다.');
+    }
+
+    return {
+      roomId,
+      userId,
+      isReady,
+    };
+  }
+
+  async findLobbyStateForMember(roomId: number, userId: number) {
+    const roomRepository = this.dataSource.getRepository(Room);
+
+    const room = await roomRepository
+      .createQueryBuilder('room')
+
+      // 현재 사용자가 실제 참여자인지 확인
+      .innerJoin(
+        'room.members',
+        'myMembership',
+        `
+        myMembership.userId = :userId
+        AND myMembership.leftAt IS NULL
+      `,
+        { userId },
+      )
+
+      // 방장 정보
+      .leftJoinAndSelect('room.host', 'host')
+
+      // 방의 전체 활성 참여자
+      .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
+      .leftJoinAndSelect('members.user', 'memberUser')
+
+      .where('room.id = :roomId', {
+        roomId,
+      })
+      .andWhere('room.status IN (:...statuses)', {
+        statuses: [RoomStatus.WAITING, RoomStatus.COUNTDOWN],
+      })
+      .getOne();
+
+    if (!room) {
+      throw new ForbiddenException('참여 중인 대기실이 아닙니다.');
+    }
+
+    const members = room.members.sort(
+      (a, b) => a.joinedAt.getTime() - b.joinedAt.getTime(),
+    );
+
+    return {
+      id: room.id,
+      title: room.title,
+      status: room.status,
+
+      hostId: room.hostId,
+
+      host: {
+        id: room.host.id,
+        nickname: room.host.nickname,
+        profileImageUrl: room.host.profileImageUrl,
+      },
+
+      minParticipants: room.minParticipants,
+      maxParticipants: room.maxParticipants,
+      currentParticipants: members.length,
+
+      isPublic: room.isPublic,
+      inviteCode: room.inviteCode,
+      relayCount: room.relayCount,
+      timeLimitSeconds: room.timeLimitSeconds,
+
+      members: members.map((member) => ({
+        memberId: member.id,
+        userId: member.userId,
+        nickname: member.user.nickname,
+        profileImageUrl: member.user.profileImageUrl,
+        isReady: member.isReady,
+        isHost: member.userId === room.hostId,
+        joinedAt: member.joinedAt,
+      })),
+    };
   }
 }
