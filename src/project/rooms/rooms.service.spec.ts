@@ -16,6 +16,7 @@ describe('RoomsService', () => {
     orderBy: jest.fn(),
     addOrderBy: jest.fn(),
     getOne: jest.fn(),
+    getMany: jest.fn(),
   };
   const roomRepository = {
     createQueryBuilder: jest.fn(),
@@ -33,6 +34,7 @@ describe('RoomsService', () => {
     queryBuilder.orderBy.mockReturnValue(queryBuilder);
     queryBuilder.addOrderBy.mockReturnValue(queryBuilder);
     roomRepository.createQueryBuilder.mockReturnValue(queryBuilder);
+    queryBuilder.getMany.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -150,6 +152,38 @@ describe('RoomsService', () => {
 
     await expect(service.findOne(999, 3)).rejects.toThrow(
       new ForbiddenException('참여 중인 대기실이 아닙니다.'),
+    );
+  });
+
+  it('내 참여방 목록 조회는 종료된 방을 제외한다 (1인 1게임방 정책)', async () => {
+    queryBuilder.getMany.mockResolvedValue([
+      {
+        id: 5,
+        title: '진행 중인 방',
+        status: RoomStatus.IN_PROGRESS,
+        maxParticipants: 6,
+        members: [{ id: 1 }],
+      },
+    ]);
+
+    await expect(service.findMyAll(3)).resolves.toEqual([
+      {
+        id: 5,
+        title: '진행 중인 방',
+        status: RoomStatus.IN_PROGRESS,
+        currentPlayers: 1,
+        maxPlayers: 6,
+      },
+    ]);
+    expect(queryBuilder.innerJoin).toHaveBeenCalledWith(
+      'room.members',
+      'myMember',
+      expect.stringContaining('myMember.leftAt IS NULL'),
+      { userId: 3 },
+    );
+    expect(queryBuilder.andWhere).toHaveBeenCalledWith(
+      'room.status != :finishedStatus',
+      { finishedStatus: RoomStatus.FINISHED },
     );
   });
 

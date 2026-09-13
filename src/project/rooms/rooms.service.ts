@@ -72,6 +72,11 @@ export class RoomsService {
         { userId },
       )
       .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
+      // 게임이 끝나도 참여 기록(leftAt)은 남으므로, 1인 1게임방 정책은
+      // '현재 진행 가능한' 방만 대상으로 한다. 종료된 방은 제외.
+      .andWhere('room.status != :finishedStatus', {
+        finishedStatus: RoomStatus.FINISHED,
+      })
       .orderBy('room.createdAt', 'DESC')
       .addOrderBy('room.id', 'DESC')
       .getMany();
