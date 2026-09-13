@@ -269,6 +269,7 @@ export class RealtimeGateway {
       roomId: game.roomId,
       gameId: game.gameId,
       status: game.status,
+      topic: game.topic,
       countdownEndsAt: game.countdownEndsAt,
       totalTurns: game.totalTurns,
       timeLimitSeconds: game.timeLimitSeconds,

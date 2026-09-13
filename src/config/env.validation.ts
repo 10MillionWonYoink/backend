@@ -3,6 +3,7 @@ import {
   IsBoolean,
   IsIn,
   IsNumber,
+  IsOptional,
   IsString,
   Max,
   Min,
@@ -40,6 +41,17 @@ class EnvironmentVariables {
   @Transform(({ value }) => value === 'true')
   @IsBoolean()
   DB_SSL: boolean = false;
+
+  // Gemini API Key. 미설정 시 AI 기능(Topic 생성/사진 평가)만 비활성화되고
+  // 나머지 애플리케이션(게임 진행 등)은 정상 동작해야 하므로 필수값으로 두지 않는다.
+  @IsOptional()
+  @IsString()
+  GEMINI_API_KEY?: string;
+
+  // 사용할 Gemini 모델. 미설정 시 GeminiService의 기본값을 사용한다.
+  @IsOptional()
+  @IsString()
+  GEMINI_MODEL?: string;
 }
 
 export function validate(config: Record<string, unknown>) {

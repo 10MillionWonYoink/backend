@@ -78,6 +78,16 @@ export class GameSession {
   })
   initialImageKey: string | null;
 
+  // 게임 시작 시 AI(Gemini)가 생성한 포토 릴레이 주제.
+  // 생성에 실패해도 게임 시작 자체를 막지 않으므로 null일 수 있다.
+  @Column({
+    name: 'topic',
+    type: 'varchar',
+    length: 500,
+    nullable: true,
+  })
+  topic: string | null;
+
   @Column({
     name: 'started_at',
     type: 'timestamptz',
