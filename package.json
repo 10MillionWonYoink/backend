@@ -90,8 +90,19 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
+      "node_modules/(@nestjs/(jwt|passport))/.+\\.js$": [
+        "ts-jest",
+        {
+          "tsconfig": {
+            "module": "commonjs"
+          }
+        }
+      ],
       "^.+\\.(t|j)s$": "ts-jest"
     },
+    "transformIgnorePatterns": [
+      "/node_modules/(?!(@nestjs/(jwt|passport))/)"
+    ],
     "collectCoverageFrom": [
       "**/*.(t|j)s"
     ],
