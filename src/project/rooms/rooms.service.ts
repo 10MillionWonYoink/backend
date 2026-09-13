@@ -9,7 +9,7 @@ import { CreateRoomDto } from './dto/create-room.dto';
 import { randomBytes } from 'node:crypto';
 import { Room, RoomStatus } from './entities/room.entity';
 import { RoomMember } from './entities/room-member.entity';
-import { DataSource, IsNull, Not } from 'typeorm';
+import { DataSource, IsNull } from 'typeorm';
 import { UpdateRoomDto } from './dto/update-room.dto';
 import { ConfigService } from '@nestjs/config';
 
@@ -427,6 +427,58 @@ export class RoomsService {
         previousHostId,
         newHostId: newHostUserId,
         message: '방장이 변경되었습니다.',
+      };
+    });
+  }
+
+  async joinRoom(roomId: number, userId: number) {
+    return this.dataSource.transaction(async (manager) => {
+      const roomRepository = manager.getRepository(Room);
+      const roomMemberRepository = manager.getRepository(RoomMember);
+
+      // 동시 입장으로 최대 인원을 초과하지 않도록 방을 잠금
+      const room = await roomRepository.findOne({
+        where: {
+          id: roomId,
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (!room) {
+        throw new NotFoundException('방을 찾을 수 없습니다.');
+      }
+
+      if (room.status !== RoomStatus.WAITING) {
+        throw new ConflictException('대기 중인 방에만 참여할 수 있습니다.');
+      }
+
+      const activeMemberCount = await roomMemberRepository.count({
+        where: {
+          roomId,
+        },
+      });
+
+      if (activeMemberCount >= room.maxParticipants) {
+        throw new ConflictException('방의 최대 인원을 초과했습니다.');
+      }
+
+      // 최초 참여자는 새로운 행 생성
+      const member = roomMemberRepository.create({
+        roomId,
+        userId,
+        isReady: false,
+        turnOrder: null,
+      });
+
+      const savedMember = await roomMemberRepository.save(member);
+
+      return {
+        message: '방에 참여했습니다.',
+        roomId,
+        memberId: savedMember.id,
+        alreadyJoined: false,
       };
     });
   }
