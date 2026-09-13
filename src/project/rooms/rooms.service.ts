@@ -463,9 +463,26 @@ export class RoomsService {
         throw new ConflictException('대기 중인 방에만 참여할 수 있습니다.');
       }
 
+      // (roomId, userId)는 유니크 제약이므로, 나갔다 돌아온 사용자의 행이
+      // 이미 있는지 먼저 확인한다 (없으면 최초 참여).
+      const existingMember = await roomMemberRepository.findOne({
+        where: {
+          roomId,
+          userId,
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (existingMember && existingMember.leftAt === null) {
+        throw new ConflictException('이미 참여 중인 방입니다.');
+      }
+
       const activeMemberCount = await roomMemberRepository.count({
         where: {
           roomId,
+          leftAt: IsNull(),
         },
       });
 
@@ -473,20 +490,33 @@ export class RoomsService {
         throw new ConflictException('방의 최대 인원을 초과했습니다.');
       }
 
-      // 최초 참여자는 새로운 행 생성
-      const member = roomMemberRepository.create({
-        roomId,
-        userId,
-        isReady: false,
-        turnOrder: null,
-      });
+      let member: RoomMember;
 
-      const savedMember = await roomMemberRepository.save(member);
+      if (existingMember) {
+        // 이전에 나갔던 사용자가 다시 참가 (같은 행 재사용)
+        existingMember.leftAt = null;
+        existingMember.isReady = false;
+        existingMember.turnOrder = null;
+        existingMember.joinedAt = new Date();
+
+        member = await roomMemberRepository.save(existingMember);
+      } else {
+        // 최초 참여자는 새로운 행 생성
+        const newMember = roomMemberRepository.create({
+          roomId,
+          userId,
+          isReady: false,
+          turnOrder: null,
+          leftAt: null,
+        });
+
+        member = await roomMemberRepository.save(newMember);
+      }
 
       return {
         message: '방에 참여했습니다.',
         roomId,
-        memberId: savedMember.id,
+        memberId: member.id,
         alreadyJoined: false,
       };
     });

@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ForbiddenException } from '@nestjs/common';
+import { ConflictException, ForbiddenException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DataSource } from 'typeorm';
+import { DataSource, IsNull } from 'typeorm';
 import { RoomsService } from './rooms.service';
 import { Room, RoomStatus } from './entities/room.entity';
 import { RoomMember } from './entities/room-member.entity';
@@ -21,9 +21,27 @@ describe('RoomsService', () => {
   const roomRepository = {
     createQueryBuilder: jest.fn(),
     findOneBy: jest.fn(),
+    findOne: jest.fn(),
     find: jest.fn(),
   };
-  const memberRepository = { find: jest.fn() };
+  const memberRepository = {
+    find: jest.fn(),
+    findOne: jest.fn(),
+    count: jest.fn(),
+    create: jest.fn(),
+    save: jest.fn(),
+  };
+
+  const manager = {
+    getRepository: (entity: typeof Room | typeof RoomMember) =>
+      entity === Room ? roomRepository : memberRepository,
+  };
+
+  const dataSource = {
+    getRepository: (entity: typeof Room | typeof RoomMember) =>
+      entity === Room ? roomRepository : memberRepository,
+    transaction: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -35,16 +53,20 @@ describe('RoomsService', () => {
     queryBuilder.addOrderBy.mockReturnValue(queryBuilder);
     roomRepository.createQueryBuilder.mockReturnValue(queryBuilder);
     queryBuilder.getMany.mockResolvedValue([]);
+    memberRepository.create.mockImplementation((input: unknown) => input);
+    memberRepository.save.mockImplementation((input: unknown) =>
+      Promise.resolve(input),
+    );
+    dataSource.transaction.mockImplementation(
+      (cb: (manager: typeof manager) => unknown) => cb(manager),
+    );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         RoomsService,
         {
           provide: DataSource,
-          useValue: {
-            getRepository: (entity: typeof Room | typeof RoomMember) =>
-              entity === Room ? roomRepository : memberRepository,
-          },
+          useValue: dataSource,
         },
         { provide: ConfigService, useValue: {} },
       ],
@@ -255,5 +277,115 @@ describe('RoomsService', () => {
     ]);
 
     await expect(service.findAll()).resolves.toEqual([]);
+  });
+
+  describe('joinRoom', () => {
+    const waitingRoom = {
+      id: 14,
+      status: RoomStatus.WAITING,
+      maxParticipants: 2,
+    };
+
+    it('최초 참여자는 새로운 RoomMember 행을 생성한다', async () => {
+      roomRepository.findOne.mockResolvedValue(waitingRoom);
+      memberRepository.findOne.mockResolvedValue(null);
+      memberRepository.count.mockResolvedValue(0);
+      memberRepository.save.mockResolvedValue({ id: 99 });
+
+      await expect(service.joinRoom(14, 11)).resolves.toEqual({
+        message: '방에 참여했습니다.',
+        roomId: 14,
+        memberId: 99,
+        alreadyJoined: false,
+      });
+      expect(memberRepository.create).toHaveBeenCalledWith({
+        roomId: 14,
+        userId: 11,
+        isReady: false,
+        turnOrder: null,
+        leftAt: null,
+      });
+      expect(memberRepository.count).toHaveBeenCalledWith({
+        where: { roomId: 14, leftAt: IsNull() },
+      });
+    });
+
+    it('나갔던 사용자가 다시 참여하면 기존 행을 재사용하고 leftAt을 초기화한다 (23505 회귀 방지)', async () => {
+      const existingMember = {
+        id: 42,
+        roomId: 14,
+        userId: 11,
+        isReady: true,
+        turnOrder: 3,
+        leftAt: new Date('2026-01-01T00:00:00Z'),
+        joinedAt: new Date('2025-01-01T00:00:00Z'),
+      };
+      roomRepository.findOne.mockResolvedValue(waitingRoom);
+      memberRepository.findOne.mockResolvedValue(existingMember);
+      memberRepository.count.mockResolvedValue(0);
+
+      const result = await service.joinRoom(14, 11);
+
+      expect(result).toEqual({
+        message: '방에 참여했습니다.',
+        roomId: 14,
+        memberId: 42,
+        alreadyJoined: false,
+      });
+      // 새 행을 만들지 않고 기존 행을 재사용해야 한다 (UNIQUE(roomId, userId) 위반 방지)
+      expect(memberRepository.create).not.toHaveBeenCalled();
+      expect(memberRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 42,
+          leftAt: null,
+          isReady: false,
+          turnOrder: null,
+        }),
+      );
+    });
+
+    it('이미 참여 중인 사용자가 다시 참여하려 하면 거부한다', async () => {
+      roomRepository.findOne.mockResolvedValue(waitingRoom);
+      memberRepository.findOne.mockResolvedValue({
+        id: 1,
+        roomId: 14,
+        userId: 11,
+        leftAt: null,
+      });
+
+      await expect(service.joinRoom(14, 11)).rejects.toThrow(
+        new ConflictException('이미 참여 중인 방입니다.'),
+      );
+      expect(memberRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('대기 중이 아닌 방(진행/종료)에는 재입장할 수 없다', async () => {
+      roomRepository.findOne.mockResolvedValue({
+        ...waitingRoom,
+        status: RoomStatus.IN_PROGRESS,
+      });
+
+      await expect(service.joinRoom(14, 11)).rejects.toThrow(
+        new ConflictException('대기 중인 방에만 참여할 수 있습니다.'),
+      );
+      expect(memberRepository.findOne).not.toHaveBeenCalled();
+    });
+
+    it('활성 참여자 수가 최대 인원 이상이면 나갔던 사용자도 재입장할 수 없다', async () => {
+      roomRepository.findOne.mockResolvedValue(waitingRoom);
+      memberRepository.findOne.mockResolvedValue({
+        id: 42,
+        roomId: 14,
+        userId: 11,
+        leftAt: new Date(),
+      });
+      // 나간 사용자를 제외한 현재 활성 인원이 이미 최대치
+      memberRepository.count.mockResolvedValue(2);
+
+      await expect(service.joinRoom(14, 11)).rejects.toThrow(
+        new ConflictException('방의 최대 인원을 초과했습니다.'),
+      );
+      expect(memberRepository.save).not.toHaveBeenCalled();
+    });
   });
 });
