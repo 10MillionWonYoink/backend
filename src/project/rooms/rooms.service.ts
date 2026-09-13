@@ -57,6 +57,34 @@ export class RoomsService {
       .filter((room) => room.currentPlayers < room.maxPlayers);
   }
 
+  async findMyAll(userId: number) {
+    const roomRepository = this.dataSource.getRepository(Room);
+
+    const rooms = await roomRepository
+      .createQueryBuilder('room')
+      .innerJoin(
+        'room.members',
+        'myMember',
+        `
+        myMember.userId = :userId
+        AND myMember.leftAt IS NULL
+      `,
+        { userId },
+      )
+      .leftJoinAndSelect('room.members', 'members', 'members.leftAt IS NULL')
+      .orderBy('room.createdAt', 'DESC')
+      .addOrderBy('room.id', 'DESC')
+      .getMany();
+
+    return rooms.map((room) => ({
+      id: room.id,
+      title: room.title,
+      status: room.status,
+      currentPlayers: room.members.length,
+      maxPlayers: room.maxParticipants,
+    }));
+  }
+
   async create(userId: number, createRoomDto: CreateRoomDto) {
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
