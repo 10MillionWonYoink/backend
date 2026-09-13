@@ -3,7 +3,26 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Socket } from 'socket.io';
 import { AccessTokenPayload } from '../../auth/security/jwt-payload.interface';
-import { parseCookie } from 'cookie';
+import * as cookie from 'cookie';
+
+type CookieParser = (
+  cookieHeader: string,
+) => Record<string, string | undefined>;
+
+const cookieModule = cookie as unknown as {
+  parse?: CookieParser;
+  parseCookie?: CookieParser;
+};
+
+function parseCookieHeader(cookieHeader: string) {
+  const parser = cookieModule.parseCookie ?? cookieModule.parse;
+
+  if (!parser) {
+    throw new TypeError('Cookie parser is unavailable');
+  }
+
+  return parser(cookieHeader);
+}
 
 @Injectable()
 export class RealtimeAuthService {
@@ -19,7 +38,7 @@ export class RealtimeAuthService {
       throw new UnauthorizedException('인증 쿠키가 없습니다.');
     }
 
-    const cookies = parseCookie(cookieHeader);
+    const cookies = parseCookieHeader(cookieHeader);
 
     const accessToken = cookies.access_token;
 
