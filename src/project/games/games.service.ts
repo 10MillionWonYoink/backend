@@ -2,13 +2,20 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { DataSource, EntityManager, IsNull } from 'typeorm';
 import { Room, RoomStatus } from '../rooms/entities/room.entity';
 import { RoomMember } from '../rooms/entities/room-member.entity';
 import { GameSession, GameStatus } from './entities/game-session.entity';
-import { GameTurn, GameTurnStatus } from './entities/game-turn.entity';
+import {
+  GameTurn,
+  GameTurnEvaluationStatus,
+  GameTurnStatus,
+} from './entities/game-turn.entity';
+import { GeminiService } from '../ai/gemini.service';
+import { ImageUrlResolver } from './image-url.resolver';
 
 interface TurnAdvanceResult {
   finished: boolean;
@@ -22,11 +29,26 @@ interface TurnAdvanceResult {
   } | null;
 }
 
+// 서버(재)시작 시 인메모리 턴 타이머를 복구하기 위해 필요한 최소 정보.
+export type ResumableSession =
+  | { gameId: number; phase: 'countdown'; countdownEndsAt: Date }
+  | { gameId: number; phase: 'turn'; turnNumber: number; expiresAt: Date };
+
 @Injectable()
 export class GamesService {
-  constructor(private readonly dataSource: DataSource) {}
+  private readonly logger = new Logger(GamesService.name);
+
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly geminiService: GeminiService,
+    private readonly imageUrlResolver: ImageUrlResolver,
+  ) {}
 
   async startGame(roomId: number, userId: number) {
+    // 방 잠금(트랜잭션) 전에 미리 생성한다: AI 호출 동안 방/멤버 행을 잠그지 않기 위함.
+    // 실패해도 게임 시작 자체는 막지 않는다 (topic은 null로 저장됨).
+    const topic = await this.generateTopicSafely();
+
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
 
@@ -97,14 +119,16 @@ export class GamesService {
       });
 
       const countdownEndsAt = new Date(Date.now() + 3_000);
+      const totalTurns = members.length * room.relayCount;
 
       const game = gameRepository.create({
         roomId: room.id,
         status: GameStatus.COUNTDOWN,
         currentTurnNumber: 0,
-        totalTurns: room.relayCount,
+        totalTurns,
         timeLimitSeconds: room.timeLimitSeconds,
         initialImageKey: null,
+        topic,
         countdownEndsAt,
         startedAt: null,
         finishedAt: null,
@@ -121,8 +145,6 @@ export class GamesService {
        * A → B → C
        * A → B → C
        */
-      const totalTurns = members.length * room.relayCount;
-
       const turns = Array.from(
         {
           length: totalTurns,
@@ -153,6 +175,7 @@ export class GamesService {
         gameId: savedGame.id,
         roomId: room.id,
         status: savedGame.status,
+        topic: savedGame.topic,
         countdownEndsAt,
         totalTurns,
         timeLimitSeconds: savedGame.timeLimitSeconds,
@@ -233,67 +256,156 @@ export class GamesService {
   }
 
   async submitTurn(gameId: number, userId: number, imageKey: string) {
-    return this.dataSource.transaction(async (manager) => {
-      const gameRepository = manager.getRepository(GameSession);
+    // AI 평가는 턴 제출 트랜잭션 밖에서 별도로 처리한다 (평가 실패/지연이
+    // 턴 제출·게임 진행·타이머에 영향을 주지 않도록 하기 위함).
+    const { evaluation, ...result } = await this.dataSource.transaction(
+      async (manager) => {
+        const gameRepository = manager.getRepository(GameSession);
 
-      const turnRepository = manager.getRepository(GameTurn);
+        const turnRepository = manager.getRepository(GameTurn);
 
-      const game = await gameRepository.findOne({
-        where: {
-          id: gameId,
-        },
-        lock: {
-          mode: 'pessimistic_write',
-        },
-      });
+        const game = await gameRepository.findOne({
+          where: {
+            id: gameId,
+          },
+          lock: {
+            mode: 'pessimistic_write',
+          },
+        });
 
-      if (!game) {
-        throw new NotFoundException('게임을 찾을 수 없습니다.');
-      }
+        if (!game) {
+          throw new NotFoundException('게임을 찾을 수 없습니다.');
+        }
 
-      if (game.status !== GameStatus.IN_PROGRESS) {
-        throw new ConflictException('진행 중인 게임이 아닙니다.');
-      }
+        if (game.status !== GameStatus.IN_PROGRESS) {
+          throw new ConflictException('진행 중인 게임이 아닙니다.');
+        }
 
-      const currentTurn = await turnRepository.findOneBy({
-        gameSessionId: game.id,
-        turnNumber: game.currentTurnNumber,
-      });
+        const currentTurn = await turnRepository.findOneBy({
+          gameSessionId: game.id,
+          turnNumber: game.currentTurnNumber,
+        });
 
-      if (!currentTurn) {
-        throw new NotFoundException('현재 턴을 찾을 수 없습니다.');
-      }
+        if (!currentTurn) {
+          throw new NotFoundException('현재 턴을 찾을 수 없습니다.');
+        }
 
-      if (currentTurn.userId !== userId) {
-        throw new ForbiddenException(
-          '현재 차례인 사용자만 제출할 수 있습니다.',
-        );
-      }
+        if (currentTurn.userId !== userId) {
+          throw new ForbiddenException(
+            '현재 차례인 사용자만 제출할 수 있습니다.',
+          );
+        }
 
-      const now = new Date();
+        const now = new Date();
 
-      if (currentTurn.expiresAt && currentTurn.expiresAt < now) {
-        throw new ConflictException('사진 제출 시간이 만료되었습니다.');
-      }
+        if (currentTurn.expiresAt && currentTurn.expiresAt < now) {
+          throw new ConflictException('사진 제출 시간이 만료되었습니다.');
+        }
 
-      currentTurn.imageKey = imageKey;
-      currentTurn.status = GameTurnStatus.SUBMITTED;
+        currentTurn.imageKey = imageKey;
+        currentTurn.status = GameTurnStatus.SUBMITTED;
 
-      currentTurn.submittedAt = now;
+        currentTurn.submittedAt = now;
 
-      await turnRepository.save(currentTurn);
+        await turnRepository.save(currentTurn);
 
-      const advanceResult = await this.advanceTurn(manager, game, now);
+        const advanceResult = await this.advanceTurn(manager, game, now);
 
-      return {
-        ...advanceResult,
-        submittedTurn: {
-          turnNumber: currentTurn.turnNumber,
-          userId: currentTurn.userId,
-          imageKey: currentTurn.imageKey,
-        },
-      };
+        return {
+          ...advanceResult,
+          submittedTurn: {
+            turnNumber: currentTurn.turnNumber,
+            userId: currentTurn.userId,
+            imageKey: currentTurn.imageKey,
+          },
+          evaluation: { turnId: currentTurn.id, topic: game.topic },
+        };
+      },
+    );
+
+    this.evaluateTurnInBackground(
+      evaluation.turnId,
+      imageKey,
+      evaluation.topic,
+    );
+
+    return result;
+  }
+
+  // 제출된 사진을 AI로 채점한다. 실패해도 예외를 밖으로 던지지 않고
+  // 턴의 평가 상태를 FAILED로 남기는 데 그친다 (게임 진행에는 영향 없음).
+  private evaluateTurnInBackground(
+    turnId: number,
+    imageKey: string,
+    topic: string | null,
+  ): void {
+    void this.runTurnEvaluation(turnId, imageKey, topic).catch((error) => {
+      this.logger.warn(
+        `턴(${turnId}) AI 평가 처리 중 예기치 못한 오류: ${
+          error instanceof Error ? error.message : '알 수 없는 오류'
+        }`,
+      );
     });
+  }
+
+  private async runTurnEvaluation(
+    turnId: number,
+    imageKey: string,
+    topic: string | null,
+  ): Promise<void> {
+    const turnRepository = this.dataSource.getRepository(GameTurn);
+
+    if (!topic) {
+      // Topic이 없으면 채점 기준이 없으므로 평가를 시도하지 않는다.
+      await turnRepository.update(turnId, {
+        aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
+      });
+
+      return;
+    }
+
+    try {
+      const imageUrl = await this.imageUrlResolver.resolve(imageKey);
+
+      const { score, feedback } = await this.geminiService.evaluatePhoto({
+        imageUrl,
+        topic,
+      });
+
+      await turnRepository.update(turnId, {
+        aiScore: score,
+        aiFeedback: feedback,
+        aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+        aiEvaluatedAt: new Date(),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `턴(${turnId}) AI 평가 실패: ${
+          error instanceof Error ? error.message : '알 수 없는 오류'
+        }`,
+      );
+
+      await turnRepository.update(turnId, {
+        aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
+      });
+    }
+  }
+
+  // 게임 시작 시 사용할 Topic을 생성한다. 실패해도 게임 시작을 막지 않고 null을 반환한다.
+  private async generateTopicSafely(): Promise<string | null> {
+    try {
+      const { topic } = await this.geminiService.generateTopic();
+
+      return topic;
+    } catch (error) {
+      this.logger.warn(
+        `게임 Topic 생성 실패: ${
+          error instanceof Error ? error.message : '알 수 없는 오류'
+        }`,
+      );
+
+      return null;
+    }
   }
 
   // 시간 초과로 제출하지 못한 턴을 만료 처리하고 다음 턴으로 진행한다.
@@ -423,6 +535,61 @@ export class GamesService {
   }
 
   // roomId 기준 가장 최근 게임(진행 중이거나 마지막으로 끝난 게임)을 조회한다.
+  // 서버가 (재)시작될 때, 인메모리로만 관리되는 턴 타이머(RealtimeGateway.turnTimers)가
+  // 유실된 진행 중인 게임을 찾아 복구할 수 있도록 최소 정보를 반환한다.
+  // COUNTDOWN 상태면 첫 턴 시작 타이머를, IN_PROGRESS면 현재 턴의 만료 타이머를 복구해야 한다.
+  async findResumableSessions(): Promise<ResumableSession[]> {
+    const gameRepository = this.dataSource.getRepository(GameSession);
+
+    const sessions = await gameRepository.find({
+      where: [
+        { status: GameStatus.COUNTDOWN },
+        { status: GameStatus.IN_PROGRESS },
+      ],
+    });
+
+    if (sessions.length === 0) {
+      return [];
+    }
+
+    const turnRepository = this.dataSource.getRepository(GameTurn);
+
+    const resumable: ResumableSession[] = [];
+
+    for (const session of sessions) {
+      if (session.status === GameStatus.COUNTDOWN) {
+        if (session.countdownEndsAt) {
+          resumable.push({
+            gameId: session.id,
+            phase: 'countdown',
+            countdownEndsAt: session.countdownEndsAt,
+          });
+        }
+
+        continue;
+      }
+
+      const currentTurn = await turnRepository.findOneBy({
+        gameSessionId: session.id,
+        turnNumber: session.currentTurnNumber,
+      });
+
+      if (
+        currentTurn?.status === GameTurnStatus.IN_PROGRESS &&
+        currentTurn.expiresAt
+      ) {
+        resumable.push({
+          gameId: session.id,
+          phase: 'turn',
+          turnNumber: currentTurn.turnNumber,
+          expiresAt: currentTurn.expiresAt,
+        });
+      }
+    }
+
+    return resumable;
+  }
+
   async findLatestGameByRoom(roomId: number, userId: number) {
     await this.assertRoomMember(roomId, userId);
 
@@ -478,6 +645,7 @@ export class GamesService {
       gameId: game.id,
       roomId: game.roomId,
       status: game.status,
+      topic: game.topic,
       countdownEndsAt: game.countdownEndsAt,
       startedAt: game.startedAt,
       finishedAt: game.finishedAt,
@@ -541,9 +709,18 @@ export class GamesService {
       roomId: game.roomId,
       roomTitle: room?.title ?? null,
       status: game.status,
+      topic: game.topic,
       totalTurns: game.totalTurns,
       startedAt: game.startedAt,
       finishedAt: game.finishedAt,
+      // 제출된 턴 중 아직 AI 채점이 끝나지 않은(PENDING) 턴이 있으면 false.
+      // 총점/순위가 이후 다시 조회할 때 바뀔 수 있다는 신호로 사용한다.
+      evaluationComplete: turns.every(
+        (turn) =>
+          turn.status !== GameTurnStatus.SUBMITTED ||
+          turn.aiEvaluationStatus !== GameTurnEvaluationStatus.PENDING,
+      ),
+      ranking: this.buildRanking(turns),
       turns: turns.map((turn) => ({
         turnNumber: turn.turnNumber,
         userId: turn.userId,
@@ -552,8 +729,66 @@ export class GamesService {
         status: turn.status,
         imageKey: turn.imageKey,
         submittedAt: turn.submittedAt,
+        score:
+          turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
+            ? turn.aiScore
+            : null,
+        feedback:
+          turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
+            ? turn.aiFeedback
+            : null,
       })),
     };
+  }
+
+  // 참가자별 총점(AI 채점이 끝난 SUBMITTED 턴의 score 합)과 순위를 계산한다.
+  // 동점은 표준 경쟁 순위(1224 방식)로 처리한다: 예) [100, 100, 80] -> [1, 1, 3]
+  private buildRanking(
+    turns: GameTurn[],
+  ): { userId: number; nickname: string; totalScore: number; rank: number }[] {
+    const totalsByUser = new Map<
+      number,
+      { nickname: string; totalScore: number }
+    >();
+
+    for (const turn of turns) {
+      const nickname = turn.user.nickname ?? '익명';
+
+      const entry = totalsByUser.get(turn.userId) ?? {
+        nickname,
+        totalScore: 0,
+      };
+
+      if (
+        turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED &&
+        turn.aiScore !== null
+      ) {
+        entry.totalScore += turn.aiScore;
+      }
+
+      totalsByUser.set(turn.userId, entry);
+    }
+
+    const sorted = Array.from(totalsByUser.entries())
+      .map(([userId, { nickname, totalScore }]) => ({
+        userId,
+        nickname,
+        totalScore,
+      }))
+      .sort((a, b) => b.totalScore - a.totalScore);
+
+    let previousScore: number | null = null;
+    let previousRank = 0;
+
+    return sorted.map((entry, index) => {
+      const rank =
+        previousScore === entry.totalScore ? previousRank : index + 1;
+
+      previousScore = entry.totalScore;
+      previousRank = rank;
+
+      return { ...entry, rank };
+    });
   }
 
   private async findGameOrThrow(gameId: number): Promise<GameSession> {

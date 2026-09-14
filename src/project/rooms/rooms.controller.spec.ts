@@ -57,7 +57,7 @@ describe('RoomsController', () => {
       .get('/api/rooms/12')
       .expect(200)
       .expect(response);
-    expect(roomsService.findOne).toHaveBeenCalledWith(12);
+    expect(roomsService.findOne).toHaveBeenCalledWith(12, 3);
   });
 
   it('rejects non-integer room IDs before calling the service', async () => {
