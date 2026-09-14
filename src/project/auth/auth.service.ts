@@ -241,7 +241,7 @@ export class AuthService {
     response.cookie('signup_token', signupToken, {
       httpOnly: true,
       secure: isProduction,
-      sameSite: 'lax',
+      sameSite: 'none',
       maxAge: 30 * 60 * 1000,
     });
   }
