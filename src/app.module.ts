@@ -9,6 +9,7 @@ import { validate } from './config/env.validation';
 import { RoomsModule } from './project/rooms/rooms.module';
 import { GamesModule } from './project/games/games.module';
 import { RealtimeModule } from './project/realtime/realtime.module';
+import { UploadsModule } from './project/uploads/uploads.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { RealtimeModule } from './project/realtime/realtime.module';
     RoomsModule,
     GamesModule,
     RealtimeModule,
+    UploadsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

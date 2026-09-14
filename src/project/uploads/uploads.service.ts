@@ -1,0 +1,61 @@
+import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { randomUUID } from 'crypto';
+import { IMAGE_EXTENSION_BY_TYPE } from './types/image-type';
+
+interface CreateUploadUrlParams {
+  roomId: number;
+  userId: number;
+  contentType: keyof typeof IMAGE_EXTENSION_BY_TYPE;
+}
+
+@Injectable()
+export class UploadsService {
+  private readonly s3Client: S3Client;
+
+  private readonly bucketName: string;
+
+  constructor(private readonly configService: ConfigService) {
+    const region = this.configService.getOrThrow<string>('AWS_REGION');
+
+    this.bucketName = this.configService.getOrThrow<string>('AWS_S3_BUCKET');
+
+    this.s3Client = new S3Client({
+      region,
+    });
+  }
+
+  async createUploadUrl({
+    roomId,
+    userId,
+    contentType,
+  }: CreateUploadUrlParams) {
+    const extension = IMAGE_EXTENSION_BY_TYPE[contentType];
+
+    const objectKey = [
+      'rooms',
+      roomId,
+      'users',
+      userId,
+      `${randomUUID()}.${extension}`,
+    ].join('/');
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: objectKey,
+      ContentType: contentType,
+    });
+
+    const uploadUrl = await getSignedUrl(this.s3Client, command, {
+      expiresIn: 60,
+    });
+
+    return {
+      objectKey,
+      uploadUrl,
+      expiresIn: 60,
+    };
+  }
+}

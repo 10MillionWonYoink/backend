@@ -2,10 +2,12 @@ import { plainToInstance, Transform } from 'class-transformer';
 import {
   IsBoolean,
   IsIn,
+  IsNotEmpty,
   IsNumber,
   IsString,
   Max,
   Min,
+  ValidateIf,
   validateSync,
 } from 'class-validator';
 
@@ -40,6 +42,33 @@ class EnvironmentVariables {
   @Transform(({ value }) => value === 'true')
   @IsBoolean()
   DB_SSL: boolean = false;
+
+  // S3 설정
+  @IsString()
+  @IsNotEmpty()
+  AWS_REGION: string;
+
+  @IsString()
+  @IsNotEmpty()
+  AWS_S3_BUCKET: string;
+
+  @ValidateIf(
+    (config: EnvironmentVariables) =>
+      config.AWS_ACCESS_KEY_ID !== undefined ||
+      config.AWS_SECRET_ACCESS_KEY !== undefined,
+  )
+  @IsString()
+  @IsNotEmpty()
+  AWS_ACCESS_KEY_ID?: string;
+
+  @ValidateIf(
+    (config: EnvironmentVariables) =>
+      config.AWS_ACCESS_KEY_ID !== undefined ||
+      config.AWS_SECRET_ACCESS_KEY !== undefined,
+  )
+  @IsString()
+  @IsNotEmpty()
+  AWS_SECRET_ACCESS_KEY?: string;
 }
 
 export function validate(config: Record<string, unknown>) {
