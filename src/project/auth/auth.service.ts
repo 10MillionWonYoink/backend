@@ -235,8 +235,7 @@ export class AuthService {
       },
     );
 
-    const isProduction =
-      this.configService.get<string>('NODE_ENV') === 'production';
+    const isProduction = this.configService.get<string>('NODE_ENV') === 'dev';
 
     response.cookie('signup_token', signupToken, {
       httpOnly: true,
