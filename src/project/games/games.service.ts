@@ -161,6 +161,7 @@ export class GamesService {
             startedAt: null,
             expiresAt: null,
             submittedAt: null,
+            topic: null,
           });
         },
       );
@@ -188,7 +189,7 @@ export class GamesService {
   }
 
   async beginFirstTurn(gameId: number) {
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const gameRepository = manager.getRepository(GameSession);
 
       const turnRepository = manager.getRepository(GameTurn);
@@ -253,6 +254,13 @@ export class GamesService {
         expiresAt,
       };
     });
+
+    // 턴 시작 트랜잭션 밖에서 개인 Topic을 생성한다 (AI 호출이 턴 시작/타이머를 지연시키지 않도록).
+    if (result) {
+      this.generateTurnTopicInBackground(gameId, result.turnNumber);
+    }
+
+    return result;
   }
 
   async submitTurn(gameId: number, userId: number, imageKey: string) {
@@ -318,7 +326,8 @@ export class GamesService {
             userId: currentTurn.userId,
             imageKey: currentTurn.imageKey,
           },
-          evaluation: { turnId: currentTurn.id, topic: game.topic },
+          // 평가 기준은 게임 전체 topic이 아니라 "이 턴" 고유의 개인 미션이다.
+          evaluation: { turnId: currentTurn.id, topic: currentTurn.topic },
         };
       },
     );
@@ -328,6 +337,11 @@ export class GamesService {
       imageKey,
       evaluation.topic,
     );
+
+    // 다음 턴이 시작됐다면(게임이 끝나지 않았다면) 그 턴의 개인 Topic도 생성한다.
+    if (result.nextTurn) {
+      this.generateTurnTopicInBackground(gameId, result.nextTurn.turnNumber);
+    }
 
     return result;
   }
@@ -408,9 +422,44 @@ export class GamesService {
     }
   }
 
+  // 특정 턴의 개인 Topic을 생성해 GameTurn에 저장한다. 실패해도 예외를 밖으로
+  // 던지지 않는다 (턴은 이미 시작됐으므로, Topic이 없어도 게임 진행에는 영향이 없다).
+  private generateTurnTopicInBackground(
+    gameId: number,
+    turnNumber: number,
+  ): void {
+    void this.runTurnTopicGeneration(gameId, turnNumber).catch((error) => {
+      this.logger.warn(
+        `게임(${gameId}) 턴(${turnNumber}) Topic 생성 처리 중 예기치 못한 오류: ${
+          error instanceof Error ? error.message : '알 수 없는 오류'
+        }`,
+      );
+    });
+  }
+
+  private async runTurnTopicGeneration(
+    gameId: number,
+    turnNumber: number,
+  ): Promise<void> {
+    const topic = await this.generateTopicSafely();
+
+    if (!topic) {
+      // generateTopicSafely()가 이미 실패 사유를 로깅했다.
+      // GameTurn.topic은 컬럼 기본값(null)으로 그대로 둔다.
+      return;
+    }
+
+    const turnRepository = this.dataSource.getRepository(GameTurn);
+
+    await turnRepository.update(
+      { gameSessionId: gameId, turnNumber },
+      { topic },
+    );
+  }
+
   // 시간 초과로 제출하지 못한 턴을 만료 처리하고 다음 턴으로 진행한다.
   async expireCurrentTurn(gameId: number) {
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const gameRepository = manager.getRepository(GameSession);
 
       const turnRepository = manager.getRepository(GameTurn);
@@ -463,6 +512,13 @@ export class GamesService {
         },
       };
     });
+
+    // 다음 턴이 시작됐다면(게임이 끝나지 않았다면) 그 턴의 개인 Topic을 생성한다.
+    if (result?.nextTurn) {
+      this.generateTurnTopicInBackground(gameId, result.nextTurn.turnNumber);
+    }
+
+    return result;
   }
 
   // 현재 턴 종료(제출/만료) 후 게임을 마치거나 다음 턴을 시작한다.
@@ -660,6 +716,8 @@ export class GamesService {
               nickname: currentTurn.user.nickname,
               startedAt: currentTurn.startedAt,
               expiresAt: currentTurn.expiresAt,
+              // 개인 미션이므로 현재 턴 당사자에게만 노출한다.
+              topic: currentTurn.userId === userId ? currentTurn.topic : null,
             }
           : null,
       turns: turns.map((turn) => ({
@@ -729,6 +787,8 @@ export class GamesService {
         status: turn.status,
         imageKey: turn.imageKey,
         submittedAt: turn.submittedAt,
+        // 게임이 종료된 뒤에는 모든 참가자의 개인 Topic을 공개한다.
+        topic: turn.topic,
         score:
           turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
             ? turn.aiScore

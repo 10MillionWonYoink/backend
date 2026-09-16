@@ -107,6 +107,17 @@ export class GameTurn {
   })
   submittedAt: Date | null;
 
+  // 이 턴을 진행하는 플레이어 전용 AI(Gemini) 미션. 턴이 IN_PROGRESS로 전환된 직후
+  // 백그라운드로 생성되어 채워지므로, 턴 시작 직후 짧은 시간 동안은 null일 수 있다.
+  // 생성에 실패해도 null로 남을 뿐 턴 진행에는 영향이 없다.
+  @Column({
+    name: 'topic',
+    type: 'varchar',
+    length: 500,
+    nullable: true,
+  })
+  topic: string | null;
+
   // 제출된 사진에 대한 AI(Gemini) 채점 결과 (0~100). 미채점/채점 실패 시 null.
   @Column({
     name: 'ai_score',

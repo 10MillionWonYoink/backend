@@ -31,6 +31,8 @@ interface GamesServiceInternals {
     imageKey: string,
     topic: string | null,
   ) => void;
+  runTurnTopicGeneration: (gameId: number, turnNumber: number) => Promise<void>;
+  generateTurnTopicInBackground: (gameId: number, turnNumber: number) => void;
 }
 
 function internals(service: GamesService): GamesServiceInternals {
@@ -256,6 +258,51 @@ describe('GamesService', () => {
     });
   });
 
+  describe('beginFirstTurn', () => {
+    it('첫 턴을 시작시키고, 해당 턴의 개인 Topic 생성을 백그라운드로 트리거한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.COUNTDOWN,
+        timeLimitSeconds: 60,
+      });
+      turnRepository.findOneBy.mockResolvedValue({
+        turnNumber: 1,
+        userId: 10,
+      });
+      const generateSpy = jest
+        .spyOn(internals(service), 'generateTurnTopicInBackground')
+        .mockImplementation(() => {});
+
+      const result = await service.beginFirstTurn(5);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          gameId: 5,
+          roomId: 1,
+          turnNumber: 1,
+          userId: 10,
+        }),
+      );
+      expect(generateSpy).toHaveBeenCalledWith(5, 1);
+    });
+
+    it('중복 실행 방지로 null을 반환하면 Topic 생성을 트리거하지 않는다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        status: GameStatus.IN_PROGRESS,
+      });
+      const generateSpy = jest
+        .spyOn(internals(service), 'generateTurnTopicInBackground')
+        .mockImplementation(() => {});
+
+      const result = await service.beginFirstTurn(5);
+
+      expect(result).toBeNull();
+      expect(generateSpy).not.toHaveBeenCalled();
+    });
+  });
+
   describe('submitTurn', () => {
     const game = {
       id: 5,
@@ -311,11 +358,44 @@ describe('GamesService', () => {
       expect(result).not.toHaveProperty('evaluation');
     });
 
-    it('턴 제출은 AI 평가 완료를 기다리지 않고, 평가를 백그라운드로 위임한다', async () => {
+    it('턴 제출은 AI 평가 완료를 기다리지 않고, "이 턴의" Topic으로 평가를 백그라운드에 위임한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         ...game,
-        topic: '오늘의 하늘',
+        // 세션 전체 topic은 평가 기준으로 더 이상 쓰이지 않는다는 것을 명확히 하기 위해
+        // 턴의 topic과 다른 값으로 설정한다.
+        topic: '세션 topic(더 이상 평가에 쓰이지 않음)',
       });
+      turnRepository.findOneBy
+        .mockResolvedValueOnce({
+          id: 101,
+          gameSessionId: 5,
+          turnNumber: 1,
+          userId: 10,
+          expiresAt: new Date(Date.now() + 60_000),
+          topic: '파란색 물건 찾아 찍기',
+        })
+        .mockResolvedValueOnce({
+          gameSessionId: 5,
+          turnNumber: 2,
+          userId: 11,
+        });
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateTurnInBackground')
+        .mockImplementation(() => {});
+
+      const result = await service.submitTurn(5, 10, 'key-1.jpg');
+
+      expect(evaluateSpy).toHaveBeenCalledWith(
+        101,
+        'key-1.jpg',
+        '파란색 물건 찾아 찍기',
+      );
+      // 평가 트리거는 결과가 반환되기 전에 이미 호출되어 있어야 한다 (제출을 막지 않음).
+      expect(result.finished).toBe(false);
+    });
+
+    it('다음 턴이 시작되면 그 턴의 개인 Topic 생성을 백그라운드로 트리거한다', async () => {
+      gameRepository.findOne.mockResolvedValue({ ...game });
       turnRepository.findOneBy
         .mockResolvedValueOnce({
           id: 101,
@@ -329,18 +409,16 @@ describe('GamesService', () => {
           turnNumber: 2,
           userId: 11,
         });
-      const evaluateSpy = jest
-        .spyOn(internals(service), 'evaluateTurnInBackground')
+      const generateSpy = jest
+        .spyOn(internals(service), 'generateTurnTopicInBackground')
         .mockImplementation(() => {});
 
-      const result = await service.submitTurn(5, 10, 'key-1.jpg');
+      await service.submitTurn(5, 10, 'key-1.jpg');
 
-      expect(evaluateSpy).toHaveBeenCalledWith(101, 'key-1.jpg', '오늘의 하늘');
-      // 평가 트리거는 결과가 반환되기 전에 이미 호출되어 있어야 한다 (제출을 막지 않음).
-      expect(result.finished).toBe(false);
+      expect(generateSpy).toHaveBeenCalledWith(5, 2);
     });
 
-    it('마지막 턴이면 게임과 방을 종료 상태로 만든다', async () => {
+    it('마지막 턴이면 게임과 방을 종료 상태로 만들고, 더 이상 Topic을 생성하지 않는다', async () => {
       gameRepository.findOne.mockResolvedValue({
         ...game,
         currentTurnNumber: 2,
@@ -351,6 +429,9 @@ describe('GamesService', () => {
         userId: 11,
         expiresAt: new Date(Date.now() + 60_000),
       });
+      const generateSpy = jest
+        .spyOn(internals(service), 'generateTurnTopicInBackground')
+        .mockImplementation(() => {});
 
       const result = await service.submitTurn(5, 11, 'key-2.jpg');
 
@@ -359,6 +440,7 @@ describe('GamesService', () => {
       expect(roomRepository.update).toHaveBeenCalledWith(1, {
         status: RoomStatus.FINISHED,
       });
+      expect(generateSpy).not.toHaveBeenCalled();
     });
 
     it('제한 시간이 지나면 제출을 거부한다', async () => {
@@ -410,7 +492,7 @@ describe('GamesService', () => {
       expect(result).toBeNull();
     });
 
-    it('제한 시간이 지난 턴을 만료시키고 다음 턴을 시작한다', async () => {
+    it('제한 시간이 지난 턴을 만료시키고 다음 턴을 시작하며, 그 턴의 Topic 생성을 트리거한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         id: 5,
         roomId: 1,
@@ -432,6 +514,9 @@ describe('GamesService', () => {
           turnNumber: 2,
           userId: 11,
         });
+      const generateSpy = jest
+        .spyOn(internals(service), 'generateTurnTopicInBackground')
+        .mockImplementation(() => {});
 
       const result = await service.expireCurrentTurn(5);
 
@@ -440,6 +525,33 @@ describe('GamesService', () => {
       expect(turnRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({ status: GameTurnStatus.EXPIRED }),
       );
+      expect(generateSpy).toHaveBeenCalledWith(5, 2);
+    });
+
+    it('만료로 게임이 종료되면 더 이상 Topic을 생성하지 않는다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 2,
+        totalTurns: 2,
+        timeLimitSeconds: 60,
+      });
+      turnRepository.findOneBy.mockResolvedValue({
+        gameSessionId: 5,
+        turnNumber: 2,
+        userId: 11,
+        status: GameTurnStatus.IN_PROGRESS,
+        expiresAt: new Date(Date.now() - 1_000),
+      });
+      const generateSpy = jest
+        .spyOn(internals(service), 'generateTurnTopicInBackground')
+        .mockImplementation(() => {});
+
+      const result = await service.expireCurrentTurn(5);
+
+      expect(result?.finished).toBe(true);
+      expect(generateSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -571,6 +683,31 @@ describe('GamesService', () => {
     });
   });
 
+  describe('runTurnTopicGeneration (턴별 개인 Topic 생성)', () => {
+    it('Topic 생성에 성공하면 해당 턴에 저장한다', async () => {
+      geminiService.generateTopic.mockResolvedValue({
+        topic: '파란색 물건 찾아 찍기',
+      });
+
+      await internals(service).runTurnTopicGeneration(5, 3);
+
+      expect(turnRepository.update).toHaveBeenCalledWith(
+        { gameSessionId: 5, turnNumber: 3 },
+        { topic: '파란색 물건 찾아 찍기' },
+      );
+    });
+
+    it('Topic 생성이 실패해도 예외를 던지지 않고, 저장도 시도하지 않는다', async () => {
+      geminiService.generateTopic.mockRejectedValue(new Error('network'));
+
+      await expect(
+        internals(service).runTurnTopicGeneration(5, 3),
+      ).resolves.toBeUndefined();
+
+      expect(turnRepository.update).not.toHaveBeenCalled();
+    });
+  });
+
   describe('getSessionState / getResult / findLatestGameByRoom', () => {
     it('방 참여자가 아니면 세션 조회를 거부한다', async () => {
       dataSource.getRepository.mockImplementation((entity: unknown) => {
@@ -655,6 +792,52 @@ describe('GamesService', () => {
       });
     });
 
+    it('진행 중인 턴의 개인 Topic은 그 턴 당사자에게만 노출하고, 다른 참여자에게는 숨긴다', async () => {
+      const currentTurnFixture = {
+        turnNumber: 3,
+        userId: 10,
+        user: { nickname: '수연' },
+        status: GameTurnStatus.IN_PROGRESS,
+        startedAt: new Date('2026-01-01T00:00:00Z'),
+        expiresAt: new Date('2026-01-01T00:01:00Z'),
+        topic: '파란색 물건 찾아 찍기',
+      };
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return {
+            findOneBy: jest.fn().mockResolvedValue({
+              id: 5,
+              roomId: 1,
+              status: GameStatus.IN_PROGRESS,
+              topic: null,
+              currentTurnNumber: 3,
+              totalTurns: 6,
+              timeLimitSeconds: 60,
+            }),
+          };
+        }
+        if (entity === RoomMember) {
+          return { findOne: jest.fn().mockResolvedValue({ id: 1 }) };
+        }
+        if (entity === GameTurn) {
+          return { find: jest.fn().mockResolvedValue([currentTurnFixture]) };
+        }
+        throw new Error('unexpected');
+      });
+
+      const ownResult = await service.getSessionState(5, 10);
+
+      expect(ownResult.currentTurn?.topic).toBe('파란색 물건 찾아 찍기');
+
+      const otherResult = await service.getSessionState(5, 99);
+
+      expect(otherResult.currentTurn?.topic).toBeNull();
+      // 나머지 currentTurn 정보(턴 번호, 누구 차례인지 등)는 그대로 보여도 된다.
+      expect(otherResult.currentTurn?.turnNumber).toBe(3);
+      expect(otherResult.currentTurn?.userId).toBe(10);
+    });
+
     it('게임 결과에 topic, 턴별 score/feedback, 참가자별 총점·순위를 포함한다 (동점은 공동 순위)', async () => {
       const turns = [
         {
@@ -664,6 +847,7 @@ describe('GamesService', () => {
           status: GameTurnStatus.SUBMITTED,
           imageKey: 'a.jpg',
           submittedAt: new Date('2026-01-01T00:00:01Z'),
+          topic: '주변에서 웃는 얼굴처럼 보이는 물건 찾아 찍기',
           aiScore: 80,
           aiFeedback: '좋아요',
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
@@ -761,6 +945,8 @@ describe('GamesService', () => {
       expect(result.turns[0]).toEqual(
         expect.objectContaining({
           turnNumber: 1,
+          // 게임 종료 후에는 모든 참가자의 개인(턴별) Topic이 공개되어야 한다.
+          topic: '주변에서 웃는 얼굴처럼 보이는 물건 찾아 찍기',
           score: 80,
           feedback: '좋아요',
         }),
