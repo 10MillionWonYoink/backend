@@ -16,6 +16,7 @@ import {
 } from './entities/game-turn.entity';
 import { GeminiService } from '../ai/gemini.service';
 import { ImageUrlResolver } from './image-url.resolver';
+import { UploadsService } from '../uploads/uploads.service';
 
 interface TurnAdvanceResult {
   finished: boolean;
@@ -41,6 +42,7 @@ export class GamesService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly geminiService: GeminiService,
+    private readonly uploadsService: UploadsService,
     private readonly imageUrlResolver: ImageUrlResolver,
   ) {}
 
@@ -264,9 +266,34 @@ export class GamesService {
   }
 
   async submitTurn(gameId: number, userId: number, imageKey: string) {
-    // AI 평가는 턴 제출 트랜잭션 밖에서 별도로 처리한다 (평가 실패/지연이
-    // 턴 제출·게임 진행·타이머에 영향을 주지 않도록 하기 위함).
-    const { evaluation, ...result } = await this.dataSource.transaction(
+    const uploadGame = await this.dataSource
+      .getRepository(GameSession)
+      .findOne({
+        where: {
+          id: gameId,
+        },
+        select: {
+          id: true,
+          roomId: true,
+        },
+      });
+
+    if (!uploadGame) {
+      throw new NotFoundException('게임을 찾을 수 없습니다.');
+    }
+
+    // S3에 파일이 실제로 존재하는지 확인
+    await this.uploadsService.verifyUploadedImage({
+      roomId: uploadGame.roomId,
+      userId,
+      objectKey: imageKey,
+    });
+
+    // DB 저장 전에 조회 URL 생성
+    const imageUrl = await this.uploadsService.createImageReadUrl(imageKey);
+
+    // 게임 상태 확인 및 DB 저장
+    const transactionResult = await this.dataSource.transaction(
       async (manager) => {
         const gameRepository = manager.getRepository(GameSession);
 
@@ -312,7 +339,6 @@ export class GamesService {
 
         currentTurn.imageKey = imageKey;
         currentTurn.status = GameTurnStatus.SUBMITTED;
-
         currentTurn.submittedAt = now;
 
         await turnRepository.save(currentTurn);
@@ -321,17 +347,27 @@ export class GamesService {
 
         return {
           ...advanceResult,
+
           submittedTurn: {
             turnNumber: currentTurn.turnNumber,
             userId: currentTurn.userId,
-            imageKey: currentTurn.imageKey,
+
+            // nullable 프로퍼티 대신 확실한 string 변수 사용
+            imageKey,
           },
-          // 평가 기준은 게임 전체 topic이 아니라 "이 턴" 고유의 개인 미션이다.
-          evaluation: { turnId: currentTurn.id, topic: currentTurn.topic },
+
+          evaluation: {
+            turnId: currentTurn.id,
+            topic: currentTurn.topic,
+          },
         };
       },
     );
 
+    const { evaluation, ...result } = transactionResult;
+
+    // AI 평가는 턴 제출 트랜잭션 밖에서 별도로 처리한다 (평가 실패/지연이
+    // 턴 제출·게임 진행·타이머에 영향을 주지 않도록 하기 위함).
     this.evaluateTurnInBackground(
       evaluation.turnId,
       imageKey,
@@ -343,7 +379,14 @@ export class GamesService {
       this.generateTurnTopicInBackground(gameId, result.nextTurn.turnNumber);
     }
 
-    return result;
+    // DB에는 imageKey, 클라이언트에는 imageUrl까지 반환
+    return {
+      ...result,
+      submittedTurn: {
+        ...result.submittedTurn,
+        imageUrl,
+      },
+    };
   }
 
   // 제출된 사진을 AI로 채점한다. 실패해도 예외를 밖으로 던지지 않고

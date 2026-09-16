@@ -7,12 +7,14 @@ import { AiModule } from '../ai/ai.module';
 import { GameSession } from './entities/game-session.entity';
 import { GameTurn } from './entities/game-turn.entity';
 import { ImageUrlResolver } from './image-url.resolver';
+import { UploadsModule } from '../uploads/uploads.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([GameSession, GameTurn]),
     RoomsModule,
     AiModule,
+    UploadsModule,
   ],
   controllers: [GamesController],
   providers: [GamesService, ImageUrlResolver],
