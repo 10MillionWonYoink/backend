@@ -2,6 +2,7 @@ import {
   BadGatewayException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -22,6 +23,8 @@ import {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
@@ -232,13 +235,12 @@ export class AuthService {
       },
     );
 
-    const isProduction =
-      this.configService.get<string>('NODE_ENV') === 'production';
+    const isProduction = this.configService.get<string>('NODE_ENV') === 'dev';
 
     response.cookie('signup_token', signupToken, {
       httpOnly: true,
       secure: isProduction,
-      sameSite: 'lax',
+      sameSite: 'none',
       maxAge: 30 * 60 * 1000,
     });
   }
@@ -250,76 +252,161 @@ export class AuthService {
     signupToken: string | undefined,
     signupDto: SignupDto,
   ): Promise<User> {
+    this.logger.log('[completeSignup] 회원가입 완료 요청 시작');
+    this.logger.log(
+      `[completeSignup] signupToken 존재 여부=${Boolean(signupToken)}`,
+    );
+    this.logger.log(`[completeSignup] 요청 닉네임=${signupDto.nickname}`);
+
     if (!signupToken) {
+      this.logger.warn('[completeSignup] signupToken 없음');
+
       throw new UnauthorizedException('카카오 로그인이 필요합니다.');
     }
 
     let payload: SignupTokenPayload;
 
     try {
+      this.logger.log('[completeSignup] signupToken 검증 시작');
+
       payload = await this.jwtService.verifyAsync<SignupTokenPayload>(
         signupToken,
         {
           secret: this.configService.getOrThrow<string>('JWT_SIGNUP_SECRET'),
         },
       );
+
+      this.logger.log(
+        `[completeSignup] signupToken 검증 성공: ${JSON.stringify({
+          sub: payload.sub,
+          purpose: payload.purpose,
+          iat: payload.iat,
+          exp: payload.exp,
+        })}`,
+      );
     } catch {
+      this.logger.error('[completeSignup] signupToken 검증 실패');
+
       throw new UnauthorizedException('회원가입 인증이 만료되었습니다.');
     }
 
+    this.logger.log(`[completeSignup] payload purpose 확인=${payload.purpose}`);
+
     if (payload.purpose !== 'signup') {
+      this.logger.warn(`[completeSignup] 잘못된 purpose=${payload.purpose}`);
+
       throw new UnauthorizedException('올바르지 않은 회원가입 토큰입니다.');
     }
+
+    this.logger.log(
+      `[completeSignup] 가입 대기 사용자 조회 시작: userId=${payload.sub}`,
+    );
 
     const user = await this.userRepository.findOneBy({
       id: payload.sub,
     });
 
+    this.logger.log(
+      `[completeSignup] 사용자 조회 결과: found=${Boolean(user)}`,
+    );
+
     if (!user) {
+      this.logger.warn(
+        `[completeSignup] 가입 대기 사용자 없음: userId=${payload.sub}`,
+      );
+
       throw new NotFoundException('가입 대기 사용자를 찾을 수 없습니다.');
     }
 
+    this.logger.log(
+      `[completeSignup] 사용자 상태: userId=${user.id}, registrationCompleted=${user.registrationCompleted}`,
+    );
+
     if (user.registrationCompleted) {
+      this.logger.warn(
+        `[completeSignup] 이미 가입된 사용자: userId=${user.id}`,
+      );
+
       throw new ConflictException('이미 가입된 회원입니다.');
     }
 
+    this.logger.log(
+      `[completeSignup] 회원가입 정보 반영: userId=${user.id}, nickname=${signupDto.nickname}`,
+    );
+
     user.nickname = signupDto.nickname;
     user.registrationCompleted = true;
+
+    this.logger.log(`[completeSignup] 사용자 저장 요청: userId=${user.id}`);
 
     return this.userRepository.save(user);
   }
 
   async refreshLogin(refreshToken: string | undefined): Promise<User> {
+    this.logger.log('[refreshLogin] 로그인 갱신 요청 시작');
+    this.logger.log(
+      `[refreshLogin] refreshToken 존재 여부=${Boolean(refreshToken)}`,
+    );
+
     if (!refreshToken) {
+      this.logger.warn('[refreshLogin] refreshToken 없음');
+
       throw new UnauthorizedException('리프레시 토큰이 없습니다.');
     }
 
     let payload: RefreshTokenPayload;
 
     try {
+      this.logger.log('[refreshLogin] refreshToken 검증 시작');
+
       payload = await this.jwtService.verifyAsync<RefreshTokenPayload>(
         refreshToken,
         {
           secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
         },
       );
+
+      this.logger.log(
+        `[refreshLogin] refreshToken 검증 성공: ${JSON.stringify({
+          sub: payload.sub,
+          type: payload.type,
+          iat: payload.iat,
+          exp: payload.exp,
+        })}`,
+      );
     } catch {
+      this.logger.error('[refreshLogin] refreshToken 검증 실패');
+
       throw new UnauthorizedException(
         '리프레시 토큰이 만료되었거나 올바르지 않습니다.',
       );
     }
 
+    this.logger.log(`[refreshLogin] payload type 확인=${payload.type}`);
+
     if (payload.type !== 'refresh') {
+      this.logger.warn(`[refreshLogin] 잘못된 토큰 type=${payload.type}`);
+
       throw new UnauthorizedException('올바르지 않은 리프레시 토큰입니다.');
     }
+
+    this.logger.log(`[refreshLogin] 사용자 조회 시작: userId=${payload.sub}`);
 
     const user = await this.userRepository.findOneBy({
       id: payload.sub,
     });
 
+    this.logger.log(
+      `[refreshLogin] 사용자 조회 결과: found=${Boolean(user)}, registrationCompleted=${user?.registrationCompleted ?? false}`,
+    );
+
     if (!user || !user.registrationCompleted) {
+      this.logger.warn(`[refreshLogin] 로그인 불가능: userId=${payload.sub}`);
+
       throw new UnauthorizedException('로그인할 수 없는 사용자입니다.');
     }
+
+    this.logger.log(`[refreshLogin] 로그인 갱신 성공: userId=${user.id}`);
 
     return user;
   }
