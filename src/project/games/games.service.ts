@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -564,6 +565,122 @@ export class GamesService {
     return result;
   }
 
+  // 게임 진행 중(COUNTDOWN/IN_PROGRESS) 참여자가 이탈하는 상황을 처리한다.
+  //
+  // WAITING 상태의 일반적인 "방 나가기"(RoomsService.leaveRoom)와는 완전히 분리된 흐름이다:
+  // - 방장 승계나 "마지막 인원이면 방 삭제" 같은 개념은 게임 도중에는 의미가 없다.
+  // - GameSession.roomId는 onDelete: CASCADE이므로 방을 삭제하면 이미 쌓인 GameTurn(AI 평가·점수)이
+  //   통째로 사라진다 — 그래서 방은 절대 삭제하지 않고 게임을 즉시 취소 처리한다.
+  // - 릴레이 특성상 이탈한 사람의 남은 턴만 건너뛰고 계속 진행하는 것은(턴 순번 재계산 필요)
+  //   이번 범위에서는 지원하지 않고, 게임 전체를 종료한다.
+  async leaveActiveGame(gameId: number, userId: number) {
+    return this.dataSource.transaction(async (manager) => {
+      const gameRepository = manager.getRepository(GameSession);
+
+      const roomRepository = manager.getRepository(Room);
+
+      const memberRepository = manager.getRepository(RoomMember);
+
+      const turnRepository = manager.getRepository(GameTurn);
+
+      const game = await gameRepository.findOne({
+        where: {
+          id: gameId,
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (!game) {
+        throw new NotFoundException('게임을 찾을 수 없습니다.');
+      }
+
+      if (
+        game.status !== GameStatus.COUNTDOWN &&
+        game.status !== GameStatus.IN_PROGRESS
+      ) {
+        throw new ConflictException('이미 종료되었거나 취소된 게임입니다.');
+      }
+
+      const room = await roomRepository.findOne({
+        where: {
+          id: game.roomId,
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (!room) {
+        throw new NotFoundException('방을 찾을 수 없습니다.');
+      }
+
+      const leavingMember = await memberRepository.findOne({
+        where: {
+          roomId: game.roomId,
+          userId,
+          leftAt: IsNull(),
+        },
+        lock: {
+          mode: 'pessimistic_write',
+        },
+      });
+
+      if (!leavingMember) {
+        throw new BadRequestException('현재 방에 참여 중인 사용자가 아닙니다.');
+      }
+
+      // RoomsService.leaveRoom()과 동일한 방식으로 실제 삭제 대신 퇴장 시각만 기록한다.
+      leavingMember.leftAt = new Date();
+      leavingMember.isReady = false;
+      leavingMember.turnOrder = null;
+
+      await memberRepository.save(leavingMember);
+
+      const now = new Date();
+
+      const cancelledTurnNumber =
+        game.currentTurnNumber > 0 ? game.currentTurnNumber : null;
+
+      game.status = GameStatus.CANCELLED;
+      game.finishedAt = now;
+
+      await gameRepository.save(game);
+
+      // 진행 중이던 턴이 영구히 IN_PROGRESS로 남지 않도록 정리한다.
+      if (cancelledTurnNumber !== null) {
+        await turnRepository.update(
+          {
+            gameSessionId: game.id,
+            turnNumber: cancelledTurnNumber,
+            status: GameTurnStatus.IN_PROGRESS,
+          },
+          { status: GameTurnStatus.EXPIRED },
+        );
+      }
+
+      room.status = RoomStatus.FINISHED;
+
+      await roomRepository.save(room);
+
+      const remainingParticipants = await memberRepository.count({
+        where: {
+          roomId: game.roomId,
+          leftAt: IsNull(),
+        },
+      });
+
+      return {
+        gameId: game.id,
+        roomId: game.roomId,
+        leftUserId: userId,
+        cancelledTurnNumber,
+        remainingParticipants,
+      };
+    });
+  }
+
   // 현재 턴 종료(제출/만료) 후 게임을 마치거나 다음 턴을 시작한다.
   private async advanceTurn(
     manager: EntityManager,
@@ -782,7 +899,13 @@ export class GamesService {
 
     await this.assertRoomMember(game.roomId, userId);
 
-    if (game.status !== GameStatus.FINISHED) {
+    // 정상 종료(FINISHED)뿐 아니라, 참여자 이탈로 취소(CANCELLED)된 게임도
+    // 남은 참여자가 "어디까지 진행됐는지" 확인할 수 있도록 결과 조회를 허용한다.
+    // 아직 진행 중(COUNTDOWN/IN_PROGRESS)인 경우에만 막는다.
+    if (
+      game.status === GameStatus.COUNTDOWN ||
+      game.status === GameStatus.IN_PROGRESS
+    ) {
       throw new ConflictException('아직 종료되지 않은 게임입니다.');
     }
 
