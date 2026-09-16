@@ -28,4 +28,8 @@ export class GameRealtimeHandler {
   async findResumableSessions() {
     return this.gamesService.findResumableSessions();
   }
+
+  async leaveActiveGame(gameId: number, userId: number) {
+    return this.gamesService.leaveActiveGame(gameId, userId);
+  }
 }

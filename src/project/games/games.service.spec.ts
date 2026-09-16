@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   NotFoundException,
@@ -17,6 +18,7 @@ import {
 import { GeminiService } from '../ai/gemini.service';
 import { GeminiApiError } from '../ai/gemini.errors';
 import { ImageUrlResolver } from './image-url.resolver';
+import { UploadsService } from '../uploads/uploads.service';
 
 // GamesService의 fire-and-forget AI 평가(runTurnEvaluation/evaluateTurnInBackground)는
 // public API가 아니므로, 테스트에서만 타입 안전하게 접근하기 위한 헬퍼.
@@ -48,7 +50,12 @@ describe('GamesService', () => {
     save: jest.fn(),
     update: jest.fn(),
   };
-  const memberRepository = { find: jest.fn(), findOne: jest.fn() };
+  const memberRepository = {
+    find: jest.fn(),
+    findOne: jest.fn(),
+    save: jest.fn(),
+    count: jest.fn(),
+  };
   const gameRepository = {
     findOne: jest.fn(),
     findOneBy: jest.fn(),
@@ -86,6 +93,10 @@ describe('GamesService', () => {
   const imageUrlResolver = {
     resolve: jest.fn(),
   };
+  const uploadsService = {
+    verifyUploadedImage: jest.fn(),
+    createImageReadUrl: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -116,11 +127,17 @@ describe('GamesService', () => {
     );
     imageUrlResolver.resolve.mockResolvedValue('https://example.com/photo.jpg');
 
+    uploadsService.verifyUploadedImage.mockResolvedValue(undefined);
+    uploadsService.createImageReadUrl.mockResolvedValue(
+      'https://example.com/signed-read-url',
+    );
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         GamesService,
         { provide: DataSource, useValue: dataSource },
         { provide: GeminiService, useValue: geminiService },
+        { provide: UploadsService, useValue: uploadsService },
         { provide: ImageUrlResolver, useValue: imageUrlResolver },
       ],
     }).compile();
@@ -350,6 +367,7 @@ describe('GamesService', () => {
         turnNumber: 1,
         userId: 10,
         imageKey: 'key-1.jpg',
+        imageUrl: 'https://example.com/signed-read-url',
       });
       expect(result.nextTurn?.turnNumber).toBe(2);
       expect(result.nextTurn?.userId).toBe(11);
@@ -552,6 +570,120 @@ describe('GamesService', () => {
 
       expect(result?.finished).toBe(true);
       expect(generateSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('leaveActiveGame (게임 진행 중 이탈)', () => {
+    it('게임을 찾을 수 없으면 거부한다', async () => {
+      gameRepository.findOne.mockResolvedValue(null);
+
+      await expect(service.leaveActiveGame(5, 10)).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+
+    it('이미 종료되었거나 취소된 게임이면 거부한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.FINISHED,
+      });
+
+      await expect(service.leaveActiveGame(5, 10)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(roomRepository.findOne).not.toHaveBeenCalled();
+    });
+
+    it('현재 방에 참여 중인 사용자가 아니면 거부한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 1,
+      });
+      roomRepository.findOne.mockResolvedValue({ id: 1 });
+      memberRepository.findOne.mockResolvedValue(null);
+
+      await expect(service.leaveActiveGame(5, 999)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(gameRepository.save).not.toHaveBeenCalled();
+    });
+
+    it('IN_PROGRESS 게임에서 이탈하면 게임을 CANCELLED로, 방을 FINISHED로 바꾸고 현재 턴을 EXPIRED로 정리한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 3,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 1,
+        status: RoomStatus.IN_PROGRESS,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 1,
+        userId: 10,
+        leftAt: null,
+        isReady: true,
+        turnOrder: 1,
+      });
+      memberRepository.count.mockResolvedValue(1);
+
+      const result = await service.leaveActiveGame(5, 10);
+
+      const leftAtMatcher: unknown = expect.any(Date);
+
+      expect(memberRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 10,
+          isReady: false,
+          turnOrder: null,
+          leftAt: leftAtMatcher,
+        }),
+      );
+      expect(gameRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: GameStatus.CANCELLED }),
+      );
+      expect(roomRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: RoomStatus.FINISHED }),
+      );
+      expect(turnRepository.update).toHaveBeenCalledWith(
+        { gameSessionId: 5, turnNumber: 3, status: GameTurnStatus.IN_PROGRESS },
+        { status: GameTurnStatus.EXPIRED },
+      );
+      expect(result).toEqual({
+        gameId: 5,
+        roomId: 1,
+        leftUserId: 10,
+        cancelledTurnNumber: 3,
+        remainingParticipants: 1,
+      });
+    });
+
+    it('COUNTDOWN 단계(아직 턴이 시작되지 않음)에서 이탈하면 정리할 턴이 없다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 6,
+        roomId: 2,
+        status: GameStatus.COUNTDOWN,
+        currentTurnNumber: 0,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 2,
+        status: RoomStatus.COUNTDOWN,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 2,
+        userId: 20,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(1);
+
+      const result = await service.leaveActiveGame(6, 20);
+
+      expect(turnRepository.update).not.toHaveBeenCalled();
+      expect(result.cancelledTurnNumber).toBeNull();
     });
   });
 
@@ -758,6 +890,39 @@ describe('GamesService', () => {
       });
 
       await expect(service.getResult(5, 1)).rejects.toThrow(ConflictException);
+    });
+
+    it('참여자 이탈로 취소(CANCELLED)된 게임도 결과 조회는 허용한다 (남은 참여자가 진행 상황을 확인할 수 있도록)', async () => {
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return {
+            findOneBy: jest.fn().mockResolvedValue({
+              id: 5,
+              roomId: 1,
+              status: GameStatus.CANCELLED,
+              topic: null,
+              totalTurns: 4,
+              startedAt: new Date(),
+              finishedAt: new Date(),
+            }),
+          };
+        }
+        if (entity === RoomMember) {
+          return { findOne: jest.fn().mockResolvedValue({ id: 1 }) };
+        }
+        if (entity === Room) {
+          return { findOneBy: jest.fn().mockResolvedValue({ title: '방' }) };
+        }
+        if (entity === GameTurn) {
+          return { find: jest.fn().mockResolvedValue([]) };
+        }
+        throw new Error('unexpected');
+      });
+
+      const result = await service.getResult(5, 1);
+
+      expect(result.status).toBe(GameStatus.CANCELLED);
+      expect(result.ranking).toEqual([]);
     });
 
     it('가장 최근 게임을 조회한다', async () => {
