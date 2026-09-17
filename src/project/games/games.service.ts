@@ -6,7 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, EntityManager, IsNull } from 'typeorm';
+import { DataSource, EntityManager, IsNull, MoreThan } from 'typeorm';
 import { Room, RoomStatus } from '../rooms/entities/room.entity';
 import { RoomMember } from '../rooms/entities/room-member.entity';
 import { GameSession, GameStatus } from './entities/game-session.entity';
@@ -19,7 +19,7 @@ import { GeminiService } from '../ai/gemini.service';
 import { ImageUrlResolver } from './image-url.resolver';
 import { UploadsService } from '../uploads/uploads.service';
 
-interface TurnAdvanceResult {
+export interface TurnAdvanceResult {
   finished: boolean;
   gameId: number;
   roomId: number;
@@ -217,9 +217,16 @@ export class GamesService {
         return null;
       }
 
-      const firstTurn = await turnRepository.findOneBy({
-        gameSessionId: game.id,
-        turnNumber: 1,
+      // 카운트다운 중 일부 참여자가 이탈해 1번 턴이 스킵(EXPIRED)됐을 수 있으므로,
+      // turnNumber 1이 아니라 "가장 이른 WAITING 턴"을 찾는다.
+      const firstTurn = await turnRepository.findOne({
+        where: {
+          gameSessionId: game.id,
+          status: GameTurnStatus.WAITING,
+        },
+        order: {
+          turnNumber: 'ASC',
+        },
       });
 
       if (!firstTurn) {
@@ -570,11 +577,14 @@ export class GamesService {
   // WAITING 상태의 일반적인 "방 나가기"(RoomsService.leaveRoom)와는 완전히 분리된 흐름이다:
   // - 방장 승계나 "마지막 인원이면 방 삭제" 같은 개념은 게임 도중에는 의미가 없다.
   // - GameSession.roomId는 onDelete: CASCADE이므로 방을 삭제하면 이미 쌓인 GameTurn(AI 평가·점수)이
-  //   통째로 사라진다 — 그래서 방은 절대 삭제하지 않고 게임을 즉시 취소 처리한다.
-  // - 릴레이 특성상 이탈한 사람의 남은 턴만 건너뛰고 계속 진행하는 것은(턴 순번 재계산 필요)
-  //   이번 범위에서는 지원하지 않고, 게임 전체를 종료한다.
+  //   통째로 사라진다 — 그래서 방은 절대 삭제하지 않는다.
+  //
+  // 정책: 게임 전체를 취소하지 않고, 이탈한 참여자의 "아직 진행되지 않은" 턴만 EXPIRED로 건너뛴 뒤
+  // 남은 활성 참여자끼리 기존 turnNumber/라운드 구조 그대로 계속 진행한다.
+  // 남은 인원이 1명 이하가 되면 더 진행할 수 없으므로 즉시 종료(FINISHED)한다 — 이때도 정상 종료와
+  // 동일한 상태를 재사용해, 남은 참여자가 결과 화면으로 정상 이동할 수 있게 한다.
   async leaveActiveGame(gameId: number, userId: number) {
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const gameRepository = manager.getRepository(GameSession);
 
       const roomRepository = manager.getRepository(Room);
@@ -600,7 +610,7 @@ export class GamesService {
         game.status !== GameStatus.COUNTDOWN &&
         game.status !== GameStatus.IN_PROGRESS
       ) {
-        throw new ConflictException('이미 종료되었거나 취소된 게임입니다.');
+        throw new ConflictException('이미 종료된 게임입니다.');
       }
 
       const room = await roomRepository.findOne({
@@ -640,29 +650,16 @@ export class GamesService {
 
       const now = new Date();
 
-      const cancelledTurnNumber =
-        game.currentTurnNumber > 0 ? game.currentTurnNumber : null;
-
-      game.status = GameStatus.CANCELLED;
-      game.finishedAt = now;
-
-      await gameRepository.save(game);
-
-      // 진행 중이던 턴이 영구히 IN_PROGRESS로 남지 않도록 정리한다.
-      if (cancelledTurnNumber !== null) {
-        await turnRepository.update(
-          {
-            gameSessionId: game.id,
-            turnNumber: cancelledTurnNumber,
-            status: GameTurnStatus.IN_PROGRESS,
-          },
-          { status: GameTurnStatus.EXPIRED },
-        );
-      }
-
-      room.status = RoomStatus.FINISHED;
-
-      await roomRepository.save(room);
+      // 이탈한 참여자의 아직 시작되지 않은 턴은 건너뛴다. turnNumber/라운드 구조 자체는
+      // 그대로 두고(재배치하지 않음) 해당 슬롯만 EXPIRED로 남긴다.
+      await turnRepository.update(
+        {
+          gameSessionId: game.id,
+          userId,
+          status: GameTurnStatus.WAITING,
+        },
+        { status: GameTurnStatus.EXPIRED },
+      );
 
       const remainingParticipants = await memberRepository.count({
         where: {
@@ -671,17 +668,110 @@ export class GamesService {
         },
       });
 
+      // 남은 인원이 1명 이하면 더 진행할 수 없다 — 즉시 종료.
+      if (remainingParticipants <= 1) {
+        if (game.status === GameStatus.IN_PROGRESS) {
+          await turnRepository.update(
+            {
+              gameSessionId: game.id,
+              turnNumber: game.currentTurnNumber,
+              status: GameTurnStatus.IN_PROGRESS,
+            },
+            { status: GameTurnStatus.EXPIRED },
+          );
+        }
+
+        await this.finishGame(manager, game, now);
+
+        return {
+          finished: true as const,
+          gameId: game.id,
+          roomId: game.roomId,
+          leftUserId: userId,
+          remainingParticipants,
+          turnAdvance: null,
+        };
+      }
+
+      // 이탈한 사용자가 현재 진행 중인 턴의 당사자였다면, 그 턴을 만료 처리하고
+      // 남은 활성 참여자 기준으로 다음 턴을 진행한다 (COUNTDOWN 중 이탈이었다면 아직 시작된
+      // 턴이 없으므로 여기서 할 일이 없다 — beginFirstTurn이 카운트다운 종료 시 자동으로
+      // 첫 WAITING 턴을 찾아 시작한다).
+      let turnAdvance: TurnAdvanceResult | null = null;
+
+      if (game.status === GameStatus.IN_PROGRESS) {
+        const currentTurn = await turnRepository.findOneBy({
+          gameSessionId: game.id,
+          turnNumber: game.currentTurnNumber,
+        });
+
+        if (
+          currentTurn &&
+          currentTurn.userId === userId &&
+          currentTurn.status === GameTurnStatus.IN_PROGRESS
+        ) {
+          currentTurn.status = GameTurnStatus.EXPIRED;
+
+          await turnRepository.save(currentTurn);
+
+          turnAdvance = await this.advanceTurn(manager, game, now);
+        }
+      }
+
       return {
+        finished: false as const,
         gameId: game.id,
         roomId: game.roomId,
         leftUserId: userId,
-        cancelledTurnNumber,
         remainingParticipants,
+        turnAdvance,
       };
+    });
+
+    if (result.turnAdvance?.nextTurn) {
+      this.generateTurnTopicInBackground(
+        result.gameId,
+        result.turnAdvance.nextTurn.turnNumber,
+      );
+    }
+
+    return result;
+  }
+
+  // 게임을 종료 처리한다: 정상 완료든, 이탈로 인한 조기 종료든 동일하게 재사용된다.
+  // 아직 시작되지 않은(WAITING) 턴이 남아있다면(이탈/조기 종료로 더는 진행되지 않으므로) 함께 정리한다.
+  private async finishGame(
+    manager: EntityManager,
+    game: GameSession,
+    now: Date,
+  ): Promise<void> {
+    const gameRepository = manager.getRepository(GameSession);
+
+    const turnRepository = manager.getRepository(GameTurn);
+
+    const roomRepository = manager.getRepository(Room);
+
+    game.status = GameStatus.FINISHED;
+    game.finishedAt = now;
+
+    await gameRepository.save(game);
+
+    await turnRepository.update(
+      {
+        gameSessionId: game.id,
+        status: GameTurnStatus.WAITING,
+      },
+      { status: GameTurnStatus.EXPIRED },
+    );
+
+    await roomRepository.update(game.roomId, {
+      status: RoomStatus.FINISHED,
     });
   }
 
-  // 현재 턴 종료(제출/만료) 후 게임을 마치거나 다음 턴을 시작한다.
+  // 현재 턴 종료(제출/만료/이탈로 인한 스킵) 후 게임을 마치거나 다음 턴을 시작한다.
+  // 이탈한 참여자의 턴은 leaveActiveGame에서 미리 EXPIRED 처리되므로, 여기서는
+  // turnNumber 순으로 가장 가까운 WAITING 턴을 찾는 것만으로 자연스럽게 건너뛴다.
   private async advanceTurn(
     manager: EntityManager,
     game: GameSession,
@@ -691,18 +781,20 @@ export class GamesService {
 
     const turnRepository = manager.getRepository(GameTurn);
 
-    const roomRepository = manager.getRepository(Room);
+    const nextTurn = await turnRepository.findOne({
+      where: {
+        gameSessionId: game.id,
+        turnNumber: MoreThan(game.currentTurnNumber),
+        status: GameTurnStatus.WAITING,
+      },
+      order: {
+        turnNumber: 'ASC',
+      },
+    });
 
-    // 마지막 턴
-    if (game.currentTurnNumber >= game.totalTurns) {
-      game.status = GameStatus.FINISHED;
-      game.finishedAt = now;
-
-      await gameRepository.save(game);
-
-      await roomRepository.update(game.roomId, {
-        status: RoomStatus.FINISHED,
-      });
+    // 남은 활성 참여자의 WAITING 턴이 더 없음 (모든 턴 완료, 또는 나머지가 전부 이탈로 스킵됨)
+    if (!nextTurn) {
+      await this.finishGame(manager, game, now);
 
       return {
         finished: true,
@@ -710,17 +802,6 @@ export class GamesService {
         roomId: game.roomId,
         nextTurn: null,
       };
-    }
-
-    const nextTurnNumber = game.currentTurnNumber + 1;
-
-    const nextTurn = await turnRepository.findOneBy({
-      gameSessionId: game.id,
-      turnNumber: nextTurnNumber,
-    });
-
-    if (!nextTurn) {
-      throw new NotFoundException('다음 턴을 찾을 수 없습니다.');
     }
 
     const nextExpiresAt = new Date(
@@ -732,7 +813,7 @@ export class GamesService {
     nextTurn.startedAt = now;
     nextTurn.expiresAt = nextExpiresAt;
 
-    game.currentTurnNumber = nextTurnNumber;
+    game.currentTurnNumber = nextTurn.turnNumber;
 
     await turnRepository.save(nextTurn);
     await gameRepository.save(game);
@@ -899,8 +980,8 @@ export class GamesService {
 
     await this.assertRoomMember(game.roomId, userId);
 
-    // 정상 종료(FINISHED)뿐 아니라, 참여자 이탈로 취소(CANCELLED)된 게임도
-    // 남은 참여자가 "어디까지 진행됐는지" 확인할 수 있도록 결과 조회를 허용한다.
+    // FINISHED는 정상 완료뿐 아니라 참여자 이탈로 인한 조기 종료도 포함한다
+    // (leaveActiveGame 참고) — 어느 쪽이든 결과 조회를 허용한다.
     // 아직 진행 중(COUNTDOWN/IN_PROGRESS)인 경우에만 막는다.
     if (
       game.status === GameStatus.COUNTDOWN ||

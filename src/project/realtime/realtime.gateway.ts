@@ -1,6 +1,7 @@
 import {
   ConnectedSocket,
   MessageBody,
+  OnGatewayDisconnect,
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
@@ -30,7 +31,7 @@ import { WsHttpExceptionFilter } from './filters/ws-http-exception.filter';
   },
 })
 @UseFilters(WsHttpExceptionFilter)
-export class RealtimeGateway {
+export class RealtimeGateway implements OnGatewayDisconnect {
   @WebSocketServer()
   server: Namespace;
 
@@ -39,6 +40,14 @@ export class RealtimeGateway {
   // gameId 별 "다음 턴 만료"(또는 카운트다운 종료) 타이머. 인메모리이므로
   // 서버가 재시작되면 유실된다 — afterInit()에서 진행 중인 게임의 타이머를 복구한다.
   private readonly turnTimers = new Map<number, NodeJS.Timeout>();
+
+  // 게임 화면 소켓이 끊겼을 때(새로고침/일시적 네트워크 끊김 등) 곧바로 이탈 처리하지 않고
+  // 재연결 유예 시간을 둔다. "${gameId}:${userId}" 키로 관리하며, 유예 시간 내에
+  // game:subscribe로 같은 게임에 재구독하면 취소된다. 타이머 자체는 인메모리이므로
+  // turnTimers와 마찬가지로 서버 재시작 시 유실될 수 있다.
+  private readonly disconnectGraceTimers = new Map<string, NodeJS.Timeout>();
+
+  private static readonly DISCONNECT_GRACE_MS = 15_000;
 
   constructor(
     private readonly lobbyHandler: LobbyRealtimeHandler,
@@ -332,6 +341,9 @@ export class RealtimeGateway {
   ) {
     const userId = this.getUserId(client);
 
+    // 유예 시간 내 재구독이므로 예정된 연결-종료 기반 이탈 처리를 취소한다.
+    this.cancelDisconnectGrace(body.gameId, userId);
+
     const state = await this.gameHandler.getSessionState(body.gameId, userId);
 
     await this.moveChannel(client, this.gameChannel(body.gameId));
@@ -384,7 +396,7 @@ export class RealtimeGateway {
   }
 
   // 게임 진행 중(COUNTDOWN/IN_PROGRESS) 이탈. WAITING 상태의 lobby:leave와는
-  // 별개의 흐름이다 — 게임을 즉시 취소하고 남은 참여자에게 알린다.
+  // 별개의 흐름이다 — 게임 전체를 취소하지 않고, 남은 활성 참여자끼리 계속 진행한다.
   @UsePipes(
     new ValidationPipe({
       whitelist: true,
@@ -401,17 +413,7 @@ export class RealtimeGateway {
 
     this.validateChannel(client, channel);
 
-    const result = await this.gameHandler.leaveActiveGame(body.gameId, userId);
-
-    this.clearTurnTimer(result.gameId);
-
-    // 남은 참여자가 방치되지 않도록 게임 화면을 구독 중인 전원에게 즉시 알린다.
-    this.server.to(channel).emit('game:cancelled', {
-      gameId: result.gameId,
-      roomId: result.roomId,
-      leftUserId: result.leftUserId,
-      reason: 'player_left',
-    });
+    const result = await this.processGameLeave(body.gameId, userId);
 
     await client.leave(channel);
 
@@ -423,6 +425,116 @@ export class RealtimeGateway {
       success: true,
       ...result,
     };
+  }
+
+  // 소켓 연결이 끊기면(새로고침/탭·브라우저 종료 등) 곧바로 이탈 처리하지 않고
+  // 재연결 유예 시간을 둔 뒤 명시적 game:leave와 동일한 로직으로 처리한다.
+  // WAITING(로비) 단계의 연결 끊김은 별도로 다루지 않는다 — 게임 화면(game:*) 구독
+  // 중이었을 때만 대상이 된다.
+  async handleDisconnect(client: RealtimeSocket): Promise<void> {
+    const userId = client.data.userId;
+    const channel = client.data.activeSessionChannel;
+
+    if (!userId || !channel || !channel.startsWith('game:')) {
+      return;
+    }
+
+    const gameId = Number(channel.slice('game:'.length));
+
+    if (!Number.isInteger(gameId)) {
+      return;
+    }
+
+    // 같은 유저의 다른 소켓(다중 탭 등)이 이 게임 채널에 여전히 남아있다면
+    // 순간적인 연결 끊김으로 보고 이탈 처리 대상에서 제외한다.
+    const remainingSockets = await this.server.in(channel).fetchSockets();
+
+    const stillConnected = remainingSockets.some(
+      (socket) => (socket.data as RealtimeSocket['data']).userId === userId,
+    );
+
+    if (stillConnected) {
+      return;
+    }
+
+    this.scheduleDisconnectGrace(gameId, userId);
+  }
+
+  private scheduleDisconnectGrace(gameId: number, userId: number): void {
+    const key = this.disconnectGraceKey(gameId, userId);
+
+    if (this.disconnectGraceTimers.has(key)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.disconnectGraceTimers.delete(key);
+      void this.handleDisconnectGraceExpired(gameId, userId);
+    }, RealtimeGateway.DISCONNECT_GRACE_MS);
+
+    this.disconnectGraceTimers.set(key, timer);
+  }
+
+  private cancelDisconnectGrace(gameId: number, userId: number): void {
+    const key = this.disconnectGraceKey(gameId, userId);
+    const timer = this.disconnectGraceTimers.get(key);
+
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectGraceTimers.delete(key);
+    }
+  }
+
+  private disconnectGraceKey(gameId: number, userId: number): string {
+    return `${gameId}:${userId}`;
+  }
+
+  private async handleDisconnectGraceExpired(
+    gameId: number,
+    userId: number,
+  ): Promise<void> {
+    try {
+      await this.processGameLeave(gameId, userId);
+    } catch (error) {
+      // 유예 시간 사이 게임이 이미 다른 방식으로 종료되었거나, 이미 이탈 처리된 경우 등은
+      // 정상적인 경쟁 상황이므로 에러를 밖으로 던지지 않고 로그만 남긴다.
+      this.logger.warn(
+        `게임(${gameId}) 유저(${userId}) 연결 종료 유예 처리 중: ${
+          error instanceof Error ? error.message : '알 수 없는 오류'
+        }`,
+      );
+    }
+  }
+
+  // 이탈 처리 + 브로드캐스트. 명시적 game:leave와 연결 종료 유예 만료 양쪽에서 재사용한다.
+  private async processGameLeave(gameId: number, userId: number) {
+    const channel = this.gameChannel(gameId);
+
+    const result = await this.gameHandler.leaveActiveGame(gameId, userId);
+
+    // 게임이 계속되든 종료되든, 이탈 사실 자체는 항상 알린다.
+    this.server.to(channel).emit('game:player-left', {
+      gameId: result.gameId,
+      roomId: result.roomId,
+      leftUserId: result.leftUserId,
+      remainingParticipants: result.remainingParticipants,
+    });
+
+    if (result.finished) {
+      this.clearTurnTimer(result.gameId);
+
+      // 정상 종료와 동일한 이벤트를 재사용해, 남은 참여자가 기존 종료 흐름 그대로
+      // 결과 화면으로 이동할 수 있도록 한다.
+      this.server.to(channel).emit('game:finished', {
+        gameId: result.gameId,
+        roomId: result.roomId,
+      });
+    } else if (result.turnAdvance) {
+      // 이탈한 사용자가 현재 턴 당사자였던 경우 - 다음 턴 시작/게임 종료를 기존 로직으로 방송한다.
+      this.handleTurnAdvance(channel, result.turnAdvance);
+    }
+
+    return result;
   }
 
   // 카운트다운 종료 후 첫 턴을 시작한다.

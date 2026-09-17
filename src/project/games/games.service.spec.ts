@@ -65,6 +65,7 @@ describe('GamesService', () => {
   };
   const turnRepository = {
     findOneBy: jest.fn(),
+    findOne: jest.fn(),
     find: jest.fn(),
     create: jest.fn((input: unknown) => input),
     save: jest.fn((input: unknown) => Promise.resolve(input)),
@@ -283,7 +284,7 @@ describe('GamesService', () => {
         status: GameStatus.COUNTDOWN,
         timeLimitSeconds: 60,
       });
-      turnRepository.findOneBy.mockResolvedValue({
+      turnRepository.findOne.mockResolvedValue({
         turnNumber: 1,
         userId: 10,
       });
@@ -302,6 +303,12 @@ describe('GamesService', () => {
         }),
       );
       expect(generateSpy).toHaveBeenCalledWith(5, 1);
+      // 카운트다운 중 이탈로 1번 턴이 스킵됐을 수 있으므로, turnNumber 고정이 아니라
+      // "가장 이른 WAITING 턴"을 찾는다.
+      expect(turnRepository.findOne).toHaveBeenCalledWith({
+        where: { gameSessionId: 5, status: GameTurnStatus.WAITING },
+        order: { turnNumber: 'ASC' },
+      });
     });
 
     it('중복 실행 방지로 null을 반환하면 Topic 생성을 트리거하지 않는다', async () => {
@@ -347,18 +354,17 @@ describe('GamesService', () => {
 
     it('마지막 턴이 아니면 다음 턴을 시작시킨다', async () => {
       gameRepository.findOne.mockResolvedValue({ ...game });
-      turnRepository.findOneBy
-        .mockResolvedValueOnce({
-          gameSessionId: 5,
-          turnNumber: 1,
-          userId: 10,
-          expiresAt: new Date(Date.now() + 60_000),
-        })
-        .mockResolvedValueOnce({
-          gameSessionId: 5,
-          turnNumber: 2,
-          userId: 11,
-        });
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 1,
+        userId: 10,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      turnRepository.findOne.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 2,
+        userId: 11,
+      });
 
       const result = await service.submitTurn(5, 10, 'key-1.jpg');
 
@@ -383,20 +389,19 @@ describe('GamesService', () => {
         // 턴의 topic과 다른 값으로 설정한다.
         topic: '세션 topic(더 이상 평가에 쓰이지 않음)',
       });
-      turnRepository.findOneBy
-        .mockResolvedValueOnce({
-          id: 101,
-          gameSessionId: 5,
-          turnNumber: 1,
-          userId: 10,
-          expiresAt: new Date(Date.now() + 60_000),
-          topic: '파란색 물건 찾아 찍기',
-        })
-        .mockResolvedValueOnce({
-          gameSessionId: 5,
-          turnNumber: 2,
-          userId: 11,
-        });
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        id: 101,
+        gameSessionId: 5,
+        turnNumber: 1,
+        userId: 10,
+        expiresAt: new Date(Date.now() + 60_000),
+        topic: '파란색 물건 찾아 찍기',
+      });
+      turnRepository.findOne.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 2,
+        userId: 11,
+      });
       const evaluateSpy = jest
         .spyOn(internals(service), 'evaluateTurnInBackground')
         .mockImplementation(() => {});
@@ -414,19 +419,18 @@ describe('GamesService', () => {
 
     it('다음 턴이 시작되면 그 턴의 개인 Topic 생성을 백그라운드로 트리거한다', async () => {
       gameRepository.findOne.mockResolvedValue({ ...game });
-      turnRepository.findOneBy
-        .mockResolvedValueOnce({
-          id: 101,
-          gameSessionId: 5,
-          turnNumber: 1,
-          userId: 10,
-          expiresAt: new Date(Date.now() + 60_000),
-        })
-        .mockResolvedValueOnce({
-          gameSessionId: 5,
-          turnNumber: 2,
-          userId: 11,
-        });
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        id: 101,
+        gameSessionId: 5,
+        turnNumber: 1,
+        userId: 10,
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+      turnRepository.findOne.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 2,
+        userId: 11,
+      });
       const generateSpy = jest
         .spyOn(internals(service), 'generateTurnTopicInBackground')
         .mockImplementation(() => {});
@@ -519,19 +523,18 @@ describe('GamesService', () => {
         totalTurns: 2,
         timeLimitSeconds: 60,
       });
-      turnRepository.findOneBy
-        .mockResolvedValueOnce({
-          gameSessionId: 5,
-          turnNumber: 1,
-          userId: 10,
-          status: GameTurnStatus.IN_PROGRESS,
-          expiresAt: new Date(Date.now() - 1_000),
-        })
-        .mockResolvedValueOnce({
-          gameSessionId: 5,
-          turnNumber: 2,
-          userId: 11,
-        });
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 1,
+        userId: 10,
+        status: GameTurnStatus.IN_PROGRESS,
+        expiresAt: new Date(Date.now() - 1_000),
+      });
+      turnRepository.findOne.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 2,
+        userId: 11,
+      });
       const generateSpy = jest
         .spyOn(internals(service), 'generateTurnTopicInBackground')
         .mockImplementation(() => {});
@@ -611,12 +614,14 @@ describe('GamesService', () => {
       expect(gameRepository.save).not.toHaveBeenCalled();
     });
 
-    it('IN_PROGRESS 게임에서 이탈하면 게임을 CANCELLED로, 방을 FINISHED로 바꾸고 현재 턴을 EXPIRED로 정리한다', async () => {
+    it('남은 인원이 2명 이상이면 이탈자의 WAITING 턴만 EXPIRED로 건너뛰고 게임을 계속 진행한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         id: 5,
         roomId: 1,
         status: GameStatus.IN_PROGRESS,
         currentTurnNumber: 3,
+        totalTurns: 9,
+        timeLimitSeconds: 60,
       });
       roomRepository.findOne.mockResolvedValue({
         id: 1,
@@ -629,7 +634,20 @@ describe('GamesService', () => {
         isReady: true,
         turnOrder: 1,
       });
-      memberRepository.count.mockResolvedValue(1);
+      memberRepository.count.mockResolvedValue(2);
+      // 이탈한 사용자(10)가 현재(3번) 턴의 당사자
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 3,
+        userId: 10,
+        status: GameTurnStatus.IN_PROGRESS,
+      });
+      // advanceTurn이 찾는 다음 턴
+      turnRepository.findOne.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 4,
+        userId: 11,
+      });
 
       const result = await service.leaveActiveGame(5, 10);
 
@@ -643,26 +661,88 @@ describe('GamesService', () => {
           leftAt: leftAtMatcher,
         }),
       );
-      expect(gameRepository.save).toHaveBeenCalledWith(
-        expect.objectContaining({ status: GameStatus.CANCELLED }),
-      );
-      expect(roomRepository.save).toHaveBeenCalledWith(
-        expect.objectContaining({ status: RoomStatus.FINISHED }),
-      );
+      // 이탈자의 미진행 턴 스킵 (턴 번호/구조는 그대로, EXPIRED만 마킹)
       expect(turnRepository.update).toHaveBeenCalledWith(
-        { gameSessionId: 5, turnNumber: 3, status: GameTurnStatus.IN_PROGRESS },
+        { gameSessionId: 5, userId: 10, status: GameTurnStatus.WAITING },
         { status: GameTurnStatus.EXPIRED },
       );
+      // 현재 턴(3번)이 이탈자 것이었으므로 만료 처리 후 다음 턴(4번)으로 진행
+      expect(turnRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          turnNumber: 3,
+          status: GameTurnStatus.EXPIRED,
+        }),
+      );
+      // 게임 전체는 취소/종료되지 않는다
+      expect(gameRepository.save).not.toHaveBeenCalledWith(
+        expect.objectContaining({ status: GameStatus.FINISHED }),
+      );
+      expect(roomRepository.save).not.toHaveBeenCalled();
+      expect(roomRepository.update).not.toHaveBeenCalled();
+
+      const nextTurnMatcher: unknown = expect.objectContaining({
+        turnNumber: 4,
+        userId: 11,
+      });
+
       expect(result).toEqual({
+        finished: false,
         gameId: 5,
         roomId: 1,
         leftUserId: 10,
-        cancelledTurnNumber: 3,
-        remainingParticipants: 1,
+        remainingParticipants: 2,
+        turnAdvance: {
+          finished: false,
+          gameId: 5,
+          roomId: 1,
+          nextTurn: nextTurnMatcher,
+        },
       });
     });
 
-    it('COUNTDOWN 단계(아직 턴이 시작되지 않음)에서 이탈하면 정리할 턴이 없다', async () => {
+    it('이탈자가 현재 턴 당사자가 아니면 진행 중인 턴은 그대로 두고 이탈만 처리한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 3,
+        totalTurns: 9,
+        timeLimitSeconds: 60,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 1,
+        status: RoomStatus.IN_PROGRESS,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 1,
+        userId: 12,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(3);
+      // 현재(3번) 턴의 당사자는 이탈자(12)가 아니라 다른 사용자(10)
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 3,
+        userId: 10,
+        status: GameTurnStatus.IN_PROGRESS,
+      });
+
+      const result = await service.leaveActiveGame(5, 12);
+
+      // 현재 턴을 건드리지 않으므로 advanceTurn(=turnRepository.findOne)까지 가지 않는다
+      expect(turnRepository.findOne).not.toHaveBeenCalled();
+      expect(turnRepository.save).not.toHaveBeenCalled();
+      expect(result).toEqual({
+        finished: false,
+        gameId: 5,
+        roomId: 1,
+        leftUserId: 12,
+        remainingParticipants: 3,
+        turnAdvance: null,
+      });
+    });
+
+    it('COUNTDOWN 단계(아직 턴이 시작되지 않음)에서 이탈하면 진행할 턴이 없으므로 스킵만 처리한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         id: 6,
         roomId: 2,
@@ -678,12 +758,93 @@ describe('GamesService', () => {
         userId: 20,
         leftAt: null,
       });
-      memberRepository.count.mockResolvedValue(1);
+      memberRepository.count.mockResolvedValue(2);
 
       const result = await service.leaveActiveGame(6, 20);
 
-      expect(turnRepository.update).not.toHaveBeenCalled();
-      expect(result.cancelledTurnNumber).toBeNull();
+      expect(turnRepository.update).toHaveBeenCalledWith(
+        { gameSessionId: 6, userId: 20, status: GameTurnStatus.WAITING },
+        { status: GameTurnStatus.EXPIRED },
+      );
+      expect(result.turnAdvance).toBeNull();
+      expect(result.finished).toBe(false);
+    });
+
+    it('남은 인원이 1명 이하가 되면 진행 중이던 턴을 정리하고 즉시 FINISHED 처리한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 3,
+        totalTurns: 6,
+        timeLimitSeconds: 60,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 1,
+        status: RoomStatus.IN_PROGRESS,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 1,
+        userId: 10,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(1);
+
+      const result = await service.leaveActiveGame(5, 10);
+
+      // 진행 중이던 3번 턴 정리
+      expect(turnRepository.update).toHaveBeenCalledWith(
+        {
+          gameSessionId: 5,
+          turnNumber: 3,
+          status: GameTurnStatus.IN_PROGRESS,
+        },
+        { status: GameTurnStatus.EXPIRED },
+      );
+      // finishGame: 정상 종료와 동일하게 FINISHED 재사용 (CANCELLED 아님)
+      expect(gameRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: GameStatus.FINISHED }),
+      );
+      expect(roomRepository.update).toHaveBeenCalledWith(1, {
+        status: RoomStatus.FINISHED,
+      });
+      expect(result).toEqual({
+        finished: true,
+        gameId: 5,
+        roomId: 1,
+        leftUserId: 10,
+        remainingParticipants: 1,
+        turnAdvance: null,
+      });
+    });
+
+    it('COUNTDOWN 중 남은 인원이 1명 이하가 되어도 즉시 FINISHED 처리한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 6,
+        roomId: 2,
+        status: GameStatus.COUNTDOWN,
+        currentTurnNumber: 0,
+        totalTurns: 4,
+        timeLimitSeconds: 60,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 2,
+        status: RoomStatus.COUNTDOWN,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 2,
+        userId: 20,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(0);
+
+      const result = await service.leaveActiveGame(6, 20);
+
+      expect(gameRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: GameStatus.FINISHED }),
+      );
+      expect(result.finished).toBe(true);
+      expect(result.remainingParticipants).toBe(0);
     });
   });
 
@@ -892,14 +1053,14 @@ describe('GamesService', () => {
       await expect(service.getResult(5, 1)).rejects.toThrow(ConflictException);
     });
 
-    it('참여자 이탈로 취소(CANCELLED)된 게임도 결과 조회는 허용한다 (남은 참여자가 진행 상황을 확인할 수 있도록)', async () => {
+    it('참여자 이탈로 조기 종료(FINISHED)된 게임도 결과 조회는 허용한다 (남은 참여자가 진행 상황을 확인할 수 있도록)', async () => {
       dataSource.getRepository.mockImplementation((entity: unknown) => {
         if (entity === GameSession) {
           return {
             findOneBy: jest.fn().mockResolvedValue({
               id: 5,
               roomId: 1,
-              status: GameStatus.CANCELLED,
+              status: GameStatus.FINISHED,
               topic: null,
               totalTurns: 4,
               startedAt: new Date(),
@@ -921,7 +1082,7 @@ describe('GamesService', () => {
 
       const result = await service.getResult(5, 1);
 
-      expect(result.status).toBe(GameStatus.CANCELLED);
+      expect(result.status).toBe(GameStatus.FINISHED);
       expect(result.ranking).toEqual([]);
     });
 
