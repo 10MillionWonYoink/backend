@@ -15,6 +15,7 @@ interface CreateUploadUrlParams {
   roomId: number;
   userId: number;
   contentType: keyof typeof IMAGE_EXTENSION_BY_TYPE;
+  fileSize: number;
 }
 
 @Injectable()
@@ -43,6 +44,14 @@ export class UploadsService {
     objectKey: string;
   }) {
     const expectedPrefix = `rooms/${roomId}/users/${userId}/`;
+
+    console.log({
+      roomId,
+      userId,
+      objectKey: JSON.stringify(objectKey),
+      expectedPrefix: JSON.stringify(expectedPrefix),
+      matched: objectKey.startsWith(expectedPrefix),
+    });
 
     if (!objectKey.startsWith(expectedPrefix)) {
       throw new BadRequestException('올바르지 않은 이미지 경로입니다.');
@@ -91,8 +100,23 @@ export class UploadsService {
     roomId,
     userId,
     contentType,
+    fileSize,
   }: CreateUploadUrlParams) {
+    const maxSize = 10 * 1024 * 1024;
+
+    if (!Number.isInteger(fileSize) || fileSize < 1) {
+      throw new BadRequestException('올바르지 않은 파일 크기입니다.');
+    }
+
+    if (fileSize > maxSize) {
+      throw new BadRequestException('이미지 용량은 10MB 이하여야 합니다.');
+    }
+
     const extension = IMAGE_EXTENSION_BY_TYPE[contentType];
+
+    if (!extension) {
+      throw new BadRequestException('지원하지 않는 이미지 형식입니다.');
+    }
 
     const objectKey = [
       'rooms',

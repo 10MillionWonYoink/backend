@@ -1,14 +1,10 @@
-import { Body, Controller, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Post, UseGuards } from '@nestjs/common';
 import type { Request } from 'express';
 import { CreateUploadUrlDto } from './dto/create-upload-url.dto';
 import { UploadsService } from './uploads.service';
 import { JwtAuthGuard } from '../auth/security/jwt-auth-guard';
-
-interface AuthenticatedRequest extends Request {
-  user: {
-    sub: number;
-  };
-}
+import { GetUser } from '../auth/security/get-user.decorator';
+import { User } from '../users/entities/user.entity';
 
 @Controller('uploads')
 @UseGuards(JwtAuthGuard)
@@ -19,14 +15,13 @@ export class UploadsController {
   createUploadUrl(
     @Body()
     dto: CreateUploadUrlDto,
-
-    @Req()
-    request: AuthenticatedRequest,
+    @GetUser() user: User,
   ) {
     return this.uploadsService.createUploadUrl({
       roomId: dto.roomId,
-      userId: request.user.sub,
+      userId: user.id,
       contentType: dto.contentType,
+      fileSize: dto.fileSize,
     });
   }
 }
