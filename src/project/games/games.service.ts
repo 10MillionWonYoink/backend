@@ -980,9 +980,6 @@ export class GamesService {
 
     await this.assertRoomMember(game.roomId, userId);
 
-    // FINISHED는 정상 완료뿐 아니라 참여자 이탈로 인한 조기 종료도 포함한다
-    // (leaveActiveGame 참고) — 어느 쪽이든 결과 조회를 허용한다.
-    // 아직 진행 중(COUNTDOWN/IN_PROGRESS)인 경우에만 막는다.
     if (
       game.status === GameStatus.COUNTDOWN ||
       game.status === GameStatus.IN_PROGRESS
@@ -995,7 +992,10 @@ export class GamesService {
     const roomRepository = this.dataSource.getRepository(Room);
 
     const [room, turns] = await Promise.all([
-      roomRepository.findOneBy({ id: game.roomId }),
+      roomRepository.findOneBy({
+        id: game.roomId,
+      }),
+
       turnRepository.find({
         where: {
           gameSessionId: game.id,
@@ -1009,6 +1009,41 @@ export class GamesService {
       }),
     ]);
 
+    const resultTurns = await Promise.all(
+      turns.map(async (turn) => {
+        const imageUrl = turn.imageKey
+          ? await this.uploadsService.createImageReadUrl(turn.imageKey)
+          : null;
+
+        return {
+          turnNumber: turn.turnNumber,
+          userId: turn.userId,
+          nickname: turn.user.nickname,
+          profileImageUrl: turn.user.profileImageUrl,
+          status: turn.status,
+
+          // DB에 저장된 S3 객체 경로
+          imageKey: turn.imageKey,
+
+          // 프론트에서 바로 보여줄 수 있는 URL
+          imageUrl,
+
+          submittedAt: turn.submittedAt,
+          topic: turn.topic,
+
+          score:
+            turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
+              ? turn.aiScore
+              : null,
+
+          feedback:
+            turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
+              ? turn.aiFeedback
+              : null,
+        };
+      }),
+    );
+
     return {
       gameId: game.id,
       roomId: game.roomId,
@@ -1018,33 +1053,15 @@ export class GamesService {
       totalTurns: game.totalTurns,
       startedAt: game.startedAt,
       finishedAt: game.finishedAt,
-      // 제출된 턴 중 아직 AI 채점이 끝나지 않은(PENDING) 턴이 있으면 false.
-      // 총점/순위가 이후 다시 조회할 때 바뀔 수 있다는 신호로 사용한다.
+
       evaluationComplete: turns.every(
         (turn) =>
           turn.status !== GameTurnStatus.SUBMITTED ||
           turn.aiEvaluationStatus !== GameTurnEvaluationStatus.PENDING,
       ),
+
       ranking: this.buildRanking(turns),
-      turns: turns.map((turn) => ({
-        turnNumber: turn.turnNumber,
-        userId: turn.userId,
-        nickname: turn.user.nickname,
-        profileImageUrl: turn.user.profileImageUrl,
-        status: turn.status,
-        imageKey: turn.imageKey,
-        submittedAt: turn.submittedAt,
-        // 게임이 종료된 뒤에는 모든 참가자의 개인 Topic을 공개한다.
-        topic: turn.topic,
-        score:
-          turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
-            ? turn.aiScore
-            : null,
-        feedback:
-          turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED
-            ? turn.aiFeedback
-            : null,
-      })),
+      turns: resultTurns,
     };
   }
 

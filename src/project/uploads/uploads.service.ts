@@ -21,17 +21,33 @@ interface CreateUploadUrlParams {
 @Injectable()
 export class UploadsService {
   private readonly s3Client: S3Client;
-
   private readonly bucketName: string;
+  private readonly keyPrefix: string;
 
   constructor(private readonly configService: ConfigService) {
     const region = this.configService.getOrThrow<string>('AWS_REGION');
 
     this.bucketName = this.configService.getOrThrow<string>('AWS_S3_BUCKET');
 
+    this.keyPrefix =
+      this.configService
+        .get<string>('S3_KEY_PREFIX')
+        ?.trim()
+        .replace(/^\/+|\/+$/g, '') ?? '';
+
     this.s3Client = new S3Client({
       region,
     });
+  }
+
+  private createUserDirectory(roomId: number, userId: number): string {
+    const segments = ['rooms', String(roomId), 'users', String(userId)];
+
+    if (this.keyPrefix) {
+      segments.unshift(this.keyPrefix);
+    }
+
+    return `${segments.join('/')}/`;
   }
 
   async verifyUploadedImage({
@@ -43,7 +59,7 @@ export class UploadsService {
     userId: number;
     objectKey: string;
   }) {
-    const expectedPrefix = `rooms/${roomId}/users/${userId}/`;
+    const expectedPrefix = this.createUserDirectory(roomId, userId);
 
     console.log({
       roomId,
@@ -118,13 +134,9 @@ export class UploadsService {
       throw new BadRequestException('지원하지 않는 이미지 형식입니다.');
     }
 
-    const objectKey = [
-      'rooms',
-      roomId,
-      'users',
-      userId,
-      `${randomUUID()}.${extension}`,
-    ].join('/');
+    const directory = this.createUserDirectory(roomId, userId);
+
+    const objectKey = `${directory}${randomUUID()}.${extension}`;
 
     const command = new PutObjectCommand({
       Bucket: this.bucketName,
