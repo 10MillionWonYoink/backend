@@ -18,6 +18,7 @@ import { LeaveLobbyDto } from './dto/leave-lobby.dto';
 import { StartGameDto } from './dto/start-game.dto';
 import { SubscribeGameDto } from './dto/subscribe-game.dto';
 import { SubmitGameTurnDto } from './dto/submit-game-turn.dto';
+import { LeaveGameDto } from './dto/leave-game.dto';
 import { WsHttpExceptionFilter } from './filters/ws-http-exception.filter';
 
 @WebSocketGateway({
@@ -375,6 +376,48 @@ export class RealtimeGateway {
     });
 
     this.handleTurnAdvance(channel, result);
+
+    return {
+      success: true,
+      ...result,
+    };
+  }
+
+  // 게임 진행 중(COUNTDOWN/IN_PROGRESS) 이탈. WAITING 상태의 lobby:leave와는
+  // 별개의 흐름이다 — 게임을 즉시 취소하고 남은 참여자에게 알린다.
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  )
+  @SubscribeMessage('game:leave')
+  async leaveGame(
+    @ConnectedSocket() client: RealtimeSocket,
+    @MessageBody() body: LeaveGameDto,
+  ) {
+    const userId = this.getUserId(client);
+    const channel = this.gameChannel(body.gameId);
+
+    this.validateChannel(client, channel);
+
+    const result = await this.gameHandler.leaveActiveGame(body.gameId, userId);
+
+    this.clearTurnTimer(result.gameId);
+
+    // 남은 참여자가 방치되지 않도록 게임 화면을 구독 중인 전원에게 즉시 알린다.
+    this.server.to(channel).emit('game:cancelled', {
+      gameId: result.gameId,
+      roomId: result.roomId,
+      leftUserId: result.leftUserId,
+      reason: 'player_left',
+    });
+
+    await client.leave(channel);
+
+    if (client.data.activeSessionChannel === channel) {
+      delete client.data.activeSessionChannel;
+    }
 
     return {
       success: true,

@@ -11,6 +11,7 @@ describe('GameRealtimeHandler', () => {
     expireCurrentTurn: jest.fn(),
     getSessionState: jest.fn(),
     findResumableSessions: jest.fn(),
+    leaveActiveGame: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -63,5 +64,20 @@ describe('GameRealtimeHandler', () => {
 
     await expect(handler.findResumableSessions()).resolves.toEqual([]);
     expect(gamesService.findResumableSessions).toHaveBeenCalled();
+  });
+
+  it('leaveActiveGame은 GamesService.leaveActiveGame에 위임한다', async () => {
+    gamesService.leaveActiveGame.mockResolvedValue({
+      gameId: 1,
+      roomId: 2,
+      leftUserId: 3,
+    });
+
+    await expect(handler.leaveActiveGame(1, 3)).resolves.toEqual({
+      gameId: 1,
+      roomId: 2,
+      leftUserId: 3,
+    });
+    expect(gamesService.leaveActiveGame).toHaveBeenCalledWith(1, 3);
   });
 });
