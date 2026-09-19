@@ -15,9 +15,14 @@ import {
   GameTurnEvaluationStatus,
   GameTurnStatus,
 } from './entities/game-turn.entity';
-import { GeminiService } from '../ai/gemini.service';
-import { ImageUrlResolver } from './image-url.resolver';
+import {
+  GeminiService,
+  type PhotoEvaluationResultItem,
+} from '../ai/gemini.service';
 import { UploadsService } from '../uploads/uploads.service';
+
+// 사진 평가 1회 호출당 포함할 최대 이미지 수 (요청 크기/안정성을 위해 청크 단위로 나눠 호출한다).
+const EVALUATION_BATCH_SIZE = 10;
 
 export interface TurnAdvanceResult {
   finished: boolean;
@@ -44,13 +49,15 @@ export class GamesService {
     private readonly dataSource: DataSource,
     private readonly geminiService: GeminiService,
     private readonly uploadsService: UploadsService,
-    private readonly imageUrlResolver: ImageUrlResolver,
   ) {}
 
   async startGame(roomId: number, userId: number) {
-    // 방 잠금(트랜잭션) 전에 미리 생성한다: AI 호출 동안 방/멤버 행을 잠그지 않기 위함.
-    // 실패해도 게임 시작 자체는 막지 않는다 (topic은 null로 저장됨).
-    const topic = await this.generateTopicSafely();
+    // 방 잠금(트랜잭션) 전에, 필요한 턴 수를 대략 가늠해 Topic을 배치로 미리 생성한다
+    // (AI 호출 동안 방/멤버 행을 잠그지 않기 위함). 실제 턴 수는 트랜잭션 안에서
+    // 다시 정확히 계산되므로, 여기서는 추정치일 뿐이며 약간 어긋나도 무방하다
+    // (모자라면 남는 턴은 topic: null, 넘치면 앞에서부터 사용).
+    const estimatedTotalTurns = await this.estimateTotalTurns(roomId);
+    const topics = await this.generateTopicsSafely(estimatedTotalTurns);
 
     return this.dataSource.transaction(async (manager) => {
       const roomRepository = manager.getRepository(Room);
@@ -131,7 +138,9 @@ export class GamesService {
         totalTurns,
         timeLimitSeconds: room.timeLimitSeconds,
         initialImageKey: null,
-        topic,
+        // 별도 세션 Topic을 Gemini에 다시 요청하지 않고, 배치로 미리 만든 Topic 중
+        // 첫 번째를 재사용한다 (세션 Topic은 평가 기준으로 쓰이지 않는 표시용 값).
+        topic: topics[0] ?? null,
         countdownEndsAt,
         startedAt: null,
         finishedAt: null,
@@ -147,6 +156,10 @@ export class GamesService {
        * A → B → C
        * A → B → C
        * A → B → C
+       *
+       * 각 턴의 개인 Topic은 게임 시작 시 배치로 미리 생성해둔 topics를 순서대로 배정한다
+       * (턴이 시작될 때마다 별도로 Gemini를 호출하지 않는다). 추정치보다 실제 턴 수가 많아
+       * topics가 모자라면 남는 턴은 topic: null로 남긴다 (게임 진행에는 영향 없음).
        */
       const turns = Array.from(
         {
@@ -164,7 +177,7 @@ export class GamesService {
             startedAt: null,
             expiresAt: null,
             submittedAt: null,
-            topic: null,
+            topic: topics[index] ?? null,
           });
         },
       );
@@ -265,11 +278,6 @@ export class GamesService {
       };
     });
 
-    // 턴 시작 트랜잭션 밖에서 개인 Topic을 생성한다 (AI 호출이 턴 시작/타이머를 지연시키지 않도록).
-    if (result) {
-      this.generateTurnTopicInBackground(gameId, result.turnNumber);
-    }
-
     return result;
   }
 
@@ -363,149 +371,212 @@ export class GamesService {
             // nullable 프로퍼티 대신 확실한 string 변수 사용
             imageKey,
           },
-
-          evaluation: {
-            turnId: currentTurn.id,
-            topic: currentTurn.topic,
-          },
         };
       },
     );
 
-    const { evaluation, ...result } = transactionResult;
-
-    // AI 평가는 턴 제출 트랜잭션 밖에서 별도로 처리한다 (평가 실패/지연이
-    // 턴 제출·게임 진행·타이머에 영향을 주지 않도록 하기 위함).
-    this.evaluateTurnInBackground(
-      evaluation.turnId,
-      imageKey,
-      evaluation.topic,
-    );
-
-    // 다음 턴이 시작됐다면(게임이 끝나지 않았다면) 그 턴의 개인 Topic도 생성한다.
-    if (result.nextTurn) {
-      this.generateTurnTopicInBackground(gameId, result.nextTurn.turnNumber);
+    // 게임이 이번 제출로 끝났다면(마지막 턴이었다면), 지금까지 모아둔 미평가 사진들을
+    // 트랜잭션 밖에서 일괄(batch)로 채점한다 (사진 제출마다 개별 호출하지 않는다).
+    if (transactionResult.finished) {
+      this.evaluateGameInBackground(gameId);
     }
 
     // DB에는 imageKey, 클라이언트에는 imageUrl까지 반환
     return {
-      ...result,
+      ...transactionResult,
       submittedTurn: {
-        ...result.submittedTurn,
+        ...transactionResult.submittedTurn,
         imageUrl,
       },
     };
   }
 
-  // 제출된 사진을 AI로 채점한다. 실패해도 예외를 밖으로 던지지 않고
-  // 턴의 평가 상태를 FAILED로 남기는 데 그친다 (게임 진행에는 영향 없음).
-  private evaluateTurnInBackground(
-    turnId: number,
-    imageKey: string,
-    topic: string | null,
-  ): void {
-    void this.runTurnEvaluation(turnId, imageKey, topic).catch((error) => {
+  // 게임 종료 후, 아직 평가되지 않은(PENDING) 제출 사진들을 모아 Gemini에 배치로 전달해
+  // 채점한다. 실패해도 예외를 밖으로 던지지 않고 대상 턴들의 평가 상태를 FAILED로
+  // 남기는 데 그친다 (게임 진행/결과 조회 자체는 막지 않음 — score/feedback이 null일 뿐).
+  private evaluateGameInBackground(gameId: number): void {
+    void this.runGameEvaluation(gameId).catch((error) => {
       this.logger.warn(
-        `턴(${turnId}) AI 평가 처리 중 예기치 못한 오류: ${
+        `게임(${gameId}) AI 평가 배치 처리 중 예기치 못한 오류: ${
           error instanceof Error ? error.message : '알 수 없는 오류'
         }`,
       );
     });
   }
 
-  private async runTurnEvaluation(
-    turnId: number,
-    imageKey: string,
-    topic: string | null,
-  ): Promise<void> {
+  private async runGameEvaluation(gameId: number): Promise<void> {
     const turnRepository = this.dataSource.getRepository(GameTurn);
 
-    if (!topic) {
-      // Topic이 없으면 채점 기준이 없으므로 평가를 시도하지 않는다.
-      await turnRepository.update(turnId, {
+    const pendingTurns = await turnRepository.find({
+      where: {
+        gameSessionId: gameId,
+        status: GameTurnStatus.SUBMITTED,
+        aiEvaluationStatus: GameTurnEvaluationStatus.PENDING,
+      },
+    });
+
+    if (pendingTurns.length === 0) {
+      return;
+    }
+
+    // Topic이 없는 턴(Topic 생성 실패)은 채점 기준이 없으므로 평가 대상에서 제외한다.
+    const evaluableTurns: (GameTurn & { imageKey: string; topic: string })[] =
+      [];
+    const unevaluableTurnIds: number[] = [];
+
+    for (const turn of pendingTurns) {
+      if (turn.imageKey !== null && turn.topic !== null) {
+        evaluableTurns.push(
+          turn as GameTurn & { imageKey: string; topic: string },
+        );
+      } else {
+        unevaluableTurnIds.push(turn.id);
+      }
+    }
+
+    if (unevaluableTurnIds.length > 0) {
+      await turnRepository.update(unevaluableTurnIds, {
         aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
       });
+    }
+
+    for (
+      let start = 0;
+      start < evaluableTurns.length;
+      start += EVALUATION_BATCH_SIZE
+    ) {
+      const chunk = evaluableTurns.slice(start, start + EVALUATION_BATCH_SIZE);
+
+      await this.evaluateTurnChunk(chunk);
+    }
+  }
+
+  // 사진 평가 청크 하나를 Gemini에 배치로 요청하고 결과를 저장한다.
+  // 청크 하나가 실패해도 다른 청크 처리에는 영향을 주지 않는다.
+  private async evaluateTurnChunk(chunk: GameTurn[]): Promise<void> {
+    const turnRepository = this.dataSource.getRepository(GameTurn);
+
+    // chunk 내 로컬 인덱스(1-based)로 Gemini에 요청하고, 응답을 다시 turnId로 매핑한다
+    // (Gemini는 우리 DB의 turnId를 알지 못하므로, 프롬프트에서 지정한 번호를 그대로 돌려받는다).
+    const turnIdByIndex = new Map<number, number>();
+
+    const items = await Promise.all(
+      chunk.map(async (turn, index) => {
+        const turnIndex = index + 1;
+
+        turnIdByIndex.set(turnIndex, turn.id);
+
+        const imageUrl = await this.uploadsService.createImageReadUrl(
+          turn.imageKey as string,
+        );
+
+        return {
+          turnIndex,
+          imageUrl,
+          topic: turn.topic as string,
+        };
+      }),
+    );
+
+    let evaluations: PhotoEvaluationResultItem[];
+
+    try {
+      evaluations = await this.geminiService.evaluatePhotosBatch(items);
+    } catch (error) {
+      this.logger.warn(
+        `사진 평가 배치(${chunk.length}건) 실패: ${
+          error instanceof Error ? error.message : '알 수 없는 오류'
+        }`,
+      );
+
+      await turnRepository.update(
+        chunk.map((turn) => turn.id),
+        { aiEvaluationStatus: GameTurnEvaluationStatus.FAILED },
+      );
 
       return;
     }
 
-    try {
-      const imageUrl = await this.imageUrlResolver.resolve(imageKey);
+    const evaluatedTurnIds = new Set<number>();
+    const now = new Date();
 
-      const { score, feedback } = await this.geminiService.evaluatePhoto({
-        imageUrl,
-        topic,
-      });
+    for (const evaluation of evaluations) {
+      const turnId = turnIdByIndex.get(evaluation.turnIndex);
+
+      if (!turnId) {
+        // 응답에 우리가 요청하지 않은 turnIndex가 섞여 왔다면 무시한다.
+        continue;
+      }
+
+      evaluatedTurnIds.add(turnId);
+
+      // 항목별 점수는 GeminiService가 이미 각 범위(0~50/0~30/0~20)로 방어적으로 보정했다.
+      // totalScore는 Gemini에게 맡기지 않고 백엔드에서 직접 합산한다.
+      const totalScore =
+        evaluation.relevance + evaluation.expression + evaluation.creativity;
+
+      const feedback = `${evaluation.feedback} (주제 적합성 ${evaluation.relevance}/50, 표현력 ${evaluation.expression}/30, 창의성 ${evaluation.creativity}/20)`;
 
       await turnRepository.update(turnId, {
-        aiScore: score,
+        aiScore: totalScore,
         aiFeedback: feedback,
         aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
-        aiEvaluatedAt: new Date(),
+        aiEvaluatedAt: now,
       });
-    } catch (error) {
-      this.logger.warn(
-        `턴(${turnId}) AI 평가 실패: ${
-          error instanceof Error ? error.message : '알 수 없는 오류'
-        }`,
-      );
+    }
 
-      await turnRepository.update(turnId, {
+    // 응답에 포함되지 않은(누락된) 턴은 평가 실패로 남긴다.
+    const missingTurnIds = chunk
+      .map((turn) => turn.id)
+      .filter((turnId) => !evaluatedTurnIds.has(turnId));
+
+    if (missingTurnIds.length > 0) {
+      await turnRepository.update(missingTurnIds, {
         aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
       });
     }
   }
 
-  // 게임 시작 시 사용할 Topic을 생성한다. 실패해도 게임 시작을 막지 않고 null을 반환한다.
-  private async generateTopicSafely(): Promise<string | null> {
-    try {
-      const { topic } = await this.geminiService.generateTopic();
+  // 방의 현재 활성 참여자 수 × relayCount로 필요한 턴 수를 가늠한다 (Topic 배치 크기 산정용).
+  // 락을 잡지 않은 추정치이므로, startGame 트랜잭션 안에서 계산되는 실제 totalTurns와
+  // 약간 다를 수 있다 (그래도 무방하다 — 위 주석 참고).
+  private async estimateTotalTurns(roomId: number): Promise<number> {
+    const roomRepository = this.dataSource.getRepository(Room);
+    const memberRepository = this.dataSource.getRepository(RoomMember);
 
-      return topic;
+    const room = await roomRepository.findOneBy({ id: roomId });
+
+    if (!room) {
+      throw new NotFoundException('방을 찾을 수 없습니다.');
+    }
+
+    const activeMemberCount = await memberRepository.count({
+      where: { roomId, leftAt: IsNull() },
+    });
+
+    return activeMemberCount * room.relayCount;
+  }
+
+  // 게임 한 판에서 필요한 Topic을 배치로 한 번에 생성한다. 실패해도 게임 시작을 막지 않고
+  // 빈 배열을 반환한다 (모든 턴의 topic이 null로 저장될 뿐, 게임 진행에는 영향 없음).
+  private async generateTopicsSafely(count: number): Promise<string[]> {
+    if (count <= 0) {
+      return [];
+    }
+
+    try {
+      const { topics } = await this.geminiService.generateTopics(count);
+
+      return topics;
     } catch (error) {
       this.logger.warn(
-        `게임 Topic 생성 실패: ${
+        `게임 Topic 배치 생성 실패: ${
           error instanceof Error ? error.message : '알 수 없는 오류'
         }`,
       );
 
-      return null;
+      return [];
     }
-  }
-
-  // 특정 턴의 개인 Topic을 생성해 GameTurn에 저장한다. 실패해도 예외를 밖으로
-  // 던지지 않는다 (턴은 이미 시작됐으므로, Topic이 없어도 게임 진행에는 영향이 없다).
-  private generateTurnTopicInBackground(
-    gameId: number,
-    turnNumber: number,
-  ): void {
-    void this.runTurnTopicGeneration(gameId, turnNumber).catch((error) => {
-      this.logger.warn(
-        `게임(${gameId}) 턴(${turnNumber}) Topic 생성 처리 중 예기치 못한 오류: ${
-          error instanceof Error ? error.message : '알 수 없는 오류'
-        }`,
-      );
-    });
-  }
-
-  private async runTurnTopicGeneration(
-    gameId: number,
-    turnNumber: number,
-  ): Promise<void> {
-    const topic = await this.generateTopicSafely();
-
-    if (!topic) {
-      // generateTopicSafely()가 이미 실패 사유를 로깅했다.
-      // GameTurn.topic은 컬럼 기본값(null)으로 그대로 둔다.
-      return;
-    }
-
-    const turnRepository = this.dataSource.getRepository(GameTurn);
-
-    await turnRepository.update(
-      { gameSessionId: gameId, turnNumber },
-      { topic },
-    );
   }
 
   // 시간 초과로 제출하지 못한 턴을 만료 처리하고 다음 턴으로 진행한다.
@@ -564,9 +635,9 @@ export class GamesService {
       };
     });
 
-    // 다음 턴이 시작됐다면(게임이 끝나지 않았다면) 그 턴의 개인 Topic을 생성한다.
-    if (result?.nextTurn) {
-      this.generateTurnTopicInBackground(gameId, result.nextTurn.turnNumber);
+    // 이번 만료로 게임이 끝났다면, 지금까지 모아둔 미평가 사진들을 배치로 채점한다.
+    if (result?.finished) {
+      this.evaluateGameInBackground(gameId);
     }
 
     return result;
@@ -728,11 +799,10 @@ export class GamesService {
       };
     });
 
-    if (result.turnAdvance?.nextTurn) {
-      this.generateTurnTopicInBackground(
-        result.gameId,
-        result.turnAdvance.nextTurn.turnNumber,
-      );
+    // 이탈로 인해 게임이 끝났다면(인원 부족으로 즉시 종료됐든, 이탈자의 마지막 턴이었든),
+    // 지금까지 모아둔 미평가 사진들을 배치로 채점한다.
+    if (result.finished || result.turnAdvance?.finished) {
+      this.evaluateGameInBackground(result.gameId);
     }
 
     return result;
@@ -1065,14 +1135,18 @@ export class GamesService {
     };
   }
 
-  // 참가자별 총점(AI 채점이 끝난 SUBMITTED 턴의 score 합)과 순위를 계산한다.
+  // 참가자별 평균 점수(AI 채점이 끝난 SUBMITTED 턴의 score 평균)와 순위를 계산한다.
+  // 총점이 아닌 평균을 쓰는 이유: 이탈자가 발생하면 참가자별 제출 사진 수가 달라질 수
+  // 있어(leaveActiveGame 참고), 단순 합산 총점으로는 사진을 적게 낸 사람이 불리해진다.
+  // 응답 필드명은 기존 FE 계약을 유지하기 위해 그대로 totalScore를 사용하지만,
+  // 값의 의미는 "합계"가 아니라 "평균(반올림)"이다.
   // 동점은 표준 경쟁 순위(1224 방식)로 처리한다: 예) [100, 100, 80] -> [1, 1, 3]
   private buildRanking(
     turns: GameTurn[],
   ): { userId: number; nickname: string; totalScore: number; rank: number }[] {
     const totalsByUser = new Map<
       number,
-      { nickname: string; totalScore: number }
+      { nickname: string; scoreSum: number; scoredCount: number }
     >();
 
     for (const turn of turns) {
@@ -1080,24 +1154,26 @@ export class GamesService {
 
       const entry = totalsByUser.get(turn.userId) ?? {
         nickname,
-        totalScore: 0,
+        scoreSum: 0,
+        scoredCount: 0,
       };
 
       if (
         turn.aiEvaluationStatus === GameTurnEvaluationStatus.COMPLETED &&
         turn.aiScore !== null
       ) {
-        entry.totalScore += turn.aiScore;
+        entry.scoreSum += turn.aiScore;
+        entry.scoredCount += 1;
       }
 
       totalsByUser.set(turn.userId, entry);
     }
 
     const sorted = Array.from(totalsByUser.entries())
-      .map(([userId, { nickname, totalScore }]) => ({
+      .map(([userId, { nickname, scoreSum, scoredCount }]) => ({
         userId,
         nickname,
-        totalScore,
+        totalScore: scoredCount > 0 ? Math.round(scoreSum / scoredCount) : 0,
       }))
       .sort((a, b) => b.totalScore - a.totalScore);
 

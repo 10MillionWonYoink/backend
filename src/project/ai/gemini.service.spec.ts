@@ -51,32 +51,49 @@ describe('GeminiService', () => {
     service = module.get<GeminiService>(GeminiService);
   });
 
-  describe('generateTopic', () => {
-    it('정상 JSON 응답을 받으면 topic을 반환한다', async () => {
-      mockTextResponse({ topic: '오늘 가장 신나는 순간을 찍어보세요!' });
+  describe('generateTopics (배치 생성 - 게임당 1회 호출)', () => {
+    it('정상 JSON 응답을 받으면 topics 배열을 반환한다', async () => {
+      mockTextResponse({ topics: ['주제1', '주제2', '주제3'] });
 
-      await expect(service.generateTopic()).resolves.toEqual({
-        topic: '오늘 가장 신나는 순간을 찍어보세요!',
+      await expect(service.generateTopics(3)).resolves.toEqual({
+        topics: ['주제1', '주제2', '주제3'],
       });
+      expect(generateContentMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('중복/빈 문자열은 제거하고 반환한다', async () => {
+      mockTextResponse({ topics: ['주제1', '주제1', '', '  주제2  '] });
+
+      const result = await service.generateTopics(4);
+
+      expect(result.topics).toEqual(['주제1', '주제2']);
     });
 
     it('API 키가 없으면 GeminiApiError를 던진다', async () => {
       delete configValues.GEMINI_API_KEY;
 
-      await expect(service.generateTopic()).rejects.toThrow(GeminiApiError);
+      await expect(service.generateTopics(3)).rejects.toThrow(GeminiApiError);
       expect(generateContentMock).not.toHaveBeenCalled();
     });
 
     it('API 호출 자체가 실패하면 GeminiApiError를 던진다', async () => {
       generateContentMock.mockRejectedValue(new Error('network down'));
 
-      await expect(service.generateTopic()).rejects.toThrow(GeminiApiError);
+      await expect(service.generateTopics(3)).rejects.toThrow(GeminiApiError);
     });
 
-    it('topic 필드가 없는 응답은 GeminiResponseFormatError를 던진다', async () => {
+    it('topics 필드가 없는 응답은 GeminiResponseFormatError를 던진다', async () => {
       mockTextResponse({ message: 'oops' });
 
-      await expect(service.generateTopic()).rejects.toThrow(
+      await expect(service.generateTopics(3)).rejects.toThrow(
+        GeminiResponseFormatError,
+      );
+    });
+
+    it('topics가 빈 배열이면 GeminiResponseFormatError를 던진다', async () => {
+      mockTextResponse({ topics: [] });
+
+      await expect(service.generateTopics(3)).rejects.toThrow(
         GeminiResponseFormatError,
       );
     });
@@ -84,73 +101,181 @@ describe('GeminiService', () => {
     it('JSON으로 파싱할 수 없는 응답은 GeminiResponseFormatError를 던진다', async () => {
       generateContentMock.mockResolvedValue({ text: 'not-json' });
 
-      await expect(service.generateTopic()).rejects.toThrow(
+      await expect(service.generateTopics(3)).rejects.toThrow(
         GeminiResponseFormatError,
       );
     });
   });
 
-  describe('evaluatePhoto', () => {
-    it('정상 JSON 응답을 받으면 score/feedback을 반환한다', async () => {
-      mockTextResponse({ score: 87, feedback: '주제와 잘 어울려요.' });
+  describe('evaluatePhotosBatch (배치 평가 - 청크당 1회 호출)', () => {
+    it('정상 JSON 응답을 받으면 turnIndex별 평가 결과 배열을 반환한다', async () => {
+      mockTextResponse({
+        evaluations: [
+          {
+            turnIndex: 1,
+            relevance: 42,
+            expression: 25,
+            creativity: 16,
+            feedback: '좋아요',
+          },
+          {
+            turnIndex: 2,
+            relevance: 30,
+            expression: 20,
+            creativity: 10,
+            feedback: '괜찮아요',
+          },
+        ],
+      });
 
-      await expect(
-        service.evaluatePhoto({
-          imageUrl: 'https://example.com/photo.jpg',
-          topic: '오늘의 하늘',
-        }),
-      ).resolves.toEqual({ score: 87, feedback: '주제와 잘 어울려요.' });
+      const result = await service.evaluatePhotosBatch([
+        { turnIndex: 1, imageUrl: 'https://example.com/1.jpg', topic: '주제1' },
+        { turnIndex: 2, imageUrl: 'https://example.com/2.jpg', topic: '주제2' },
+      ]);
+
+      expect(result).toEqual([
+        {
+          turnIndex: 1,
+          relevance: 42,
+          expression: 25,
+          creativity: 16,
+          feedback: '좋아요',
+        },
+        {
+          turnIndex: 2,
+          relevance: 30,
+          expression: 20,
+          creativity: 10,
+          feedback: '괜찮아요',
+        },
+      ]);
+      // 사진 2장이어도 Gemini 호출은 1회
+      expect(generateContentMock).toHaveBeenCalledTimes(1);
     });
 
     it.each([
-      [150, 100],
-      [-20, 0],
-      [55.6, 56],
-    ])('점수 %d은(는) %d로 보정된다', async (rawScore, expectedScore) => {
-      mockTextResponse({ score: rawScore, feedback: '피드백' });
+      [
+        { relevance: 999, expression: -5, creativity: 100 },
+        { relevance: 50, expression: 0, creativity: 20 },
+      ],
+    ])(
+      '항목별 점수가 범위를 벗어나면 방어적으로 보정한다',
+      async (raw, expected) => {
+        mockTextResponse({
+          evaluations: [{ turnIndex: 1, ...raw, feedback: '피드백' }],
+        });
 
-      const result = await service.evaluatePhoto({
-        imageUrl: 'https://example.com/photo.jpg',
-        topic: '주제',
-      });
+        const [result] = await service.evaluatePhotosBatch([
+          {
+            turnIndex: 1,
+            imageUrl: 'https://example.com/1.jpg',
+            topic: '주제',
+          },
+        ]);
 
-      expect(result.score).toBe(expectedScore);
+        expect(result.relevance).toBe(expected.relevance);
+        expect(result.expression).toBe(expected.expression);
+        expect(result.creativity).toBe(expected.creativity);
+      },
+    );
+
+    it('API 호출 자체가 실패하면 GeminiApiError를 던진다', async () => {
+      generateContentMock.mockRejectedValue(new Error('network down'));
+
+      await expect(
+        service.evaluatePhotosBatch([
+          {
+            turnIndex: 1,
+            imageUrl: 'https://example.com/1.jpg',
+            topic: '주제',
+          },
+        ]),
+      ).rejects.toThrow(GeminiApiError);
     });
 
     it('이미지 다운로드에 실패하면 GeminiApiError를 던진다', async () => {
       global.fetch = jest.fn().mockRejectedValue(new Error('dns error'));
 
       await expect(
-        service.evaluatePhoto({
-          imageUrl: 'https://example.com/broken.jpg',
-          topic: '주제',
-        }),
+        service.evaluatePhotosBatch([
+          {
+            turnIndex: 1,
+            imageUrl: 'https://example.com/broken.jpg',
+            topic: '주제',
+          },
+        ]),
       ).rejects.toThrow(GeminiApiError);
       expect(generateContentMock).not.toHaveBeenCalled();
     });
 
     it('이미지 응답이 실패(4xx/5xx)이면 GeminiApiError를 던진다', async () => {
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: false,
-        status: 403,
-      });
+      global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 403 });
 
       await expect(
-        service.evaluatePhoto({
-          imageUrl: 'https://example.com/forbidden.jpg',
-          topic: '주제',
-        }),
+        service.evaluatePhotosBatch([
+          {
+            turnIndex: 1,
+            imageUrl: 'https://example.com/forbidden.jpg',
+            topic: '주제',
+          },
+        ]),
       ).rejects.toThrow(GeminiApiError);
     });
 
-    it('score/feedback 형식이 아니면 GeminiResponseFormatError를 던진다', async () => {
-      mockTextResponse({ score: 'not-a-number', feedback: '피드백' });
+    it('evaluations 필드가 없는 응답은 GeminiResponseFormatError를 던진다', async () => {
+      mockTextResponse({ message: 'oops' });
 
       await expect(
-        service.evaluatePhoto({
-          imageUrl: 'https://example.com/photo.jpg',
-          topic: '주제',
-        }),
+        service.evaluatePhotosBatch([
+          {
+            turnIndex: 1,
+            imageUrl: 'https://example.com/1.jpg',
+            topic: '주제',
+          },
+        ]),
+      ).rejects.toThrow(GeminiResponseFormatError);
+    });
+
+    it('형식이 맞지 않는 항목은 걸러내고, 유효한 항목만 반환한다', async () => {
+      mockTextResponse({
+        evaluations: [
+          {
+            turnIndex: 1,
+            relevance: 40,
+            expression: 20,
+            creativity: 10,
+            feedback: '좋아요',
+          },
+          {
+            turnIndex: 2,
+            relevance: 'not-a-number',
+            expression: 20,
+            creativity: 10,
+            feedback: '오류',
+          },
+        ],
+      });
+
+      const result = await service.evaluatePhotosBatch([
+        { turnIndex: 1, imageUrl: 'https://example.com/1.jpg', topic: '주제1' },
+        { turnIndex: 2, imageUrl: 'https://example.com/2.jpg', topic: '주제2' },
+      ]);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].turnIndex).toBe(1);
+    });
+
+    it('모든 항목이 형식에 맞지 않으면 GeminiResponseFormatError를 던진다', async () => {
+      mockTextResponse({ evaluations: [{ turnIndex: 1 }] });
+
+      await expect(
+        service.evaluatePhotosBatch([
+          {
+            turnIndex: 1,
+            imageUrl: 'https://example.com/1.jpg',
+            topic: '주제',
+          },
+        ]),
       ).rejects.toThrow(GeminiResponseFormatError);
     });
   });

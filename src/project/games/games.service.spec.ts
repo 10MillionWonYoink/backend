@@ -17,24 +17,15 @@ import {
 } from './entities/game-turn.entity';
 import { GeminiService } from '../ai/gemini.service';
 import { GeminiApiError } from '../ai/gemini.errors';
-import { ImageUrlResolver } from './image-url.resolver';
 import { UploadsService } from '../uploads/uploads.service';
 
-// GamesService의 fire-and-forget AI 평가(runTurnEvaluation/evaluateTurnInBackground)는
-// public API가 아니므로, 테스트에서만 타입 안전하게 접근하기 위한 헬퍼.
+// GamesService의 fire-and-forget AI 처리(배치 Topic/평가)는 public API가 아니므로,
+// 테스트에서만 타입 안전하게 접근하기 위한 헬퍼.
 interface GamesServiceInternals {
-  runTurnEvaluation: (
-    turnId: number,
-    imageKey: string,
-    topic: string | null,
-  ) => Promise<void>;
-  evaluateTurnInBackground: (
-    turnId: number,
-    imageKey: string,
-    topic: string | null,
-  ) => void;
-  runTurnTopicGeneration: (gameId: number, turnNumber: number) => Promise<void>;
-  generateTurnTopicInBackground: (gameId: number, turnNumber: number) => void;
+  runGameEvaluation: (gameId: number) => Promise<void>;
+  evaluateGameInBackground: (gameId: number) => void;
+  estimateTotalTurns: (roomId: number) => Promise<number>;
+  generateTopicsSafely: (count: number) => Promise<string[]>;
 }
 
 function internals(service: GamesService): GamesServiceInternals {
@@ -88,11 +79,8 @@ describe('GamesService', () => {
   };
 
   const geminiService = {
-    generateTopic: jest.fn(),
-    evaluatePhoto: jest.fn(),
-  };
-  const imageUrlResolver = {
-    resolve: jest.fn(),
+    generateTopics: jest.fn(),
+    evaluatePhotosBatch: jest.fn(),
   };
   const uploadsService = {
     verifyUploadedImage: jest.fn(),
@@ -117,16 +105,16 @@ describe('GamesService', () => {
       Promise.resolve(input),
     );
     turnRepository.update.mockResolvedValue({ affected: 1 });
+    turnRepository.find.mockResolvedValue([]);
 
     // 기본값: AI가 설정되어 있지 않은 것처럼 실패시켜, 기존(비AI) 테스트들이
     // "AI 실패가 게임 진행에 영향을 주지 않는다"를 자연스럽게 함께 검증하게 한다.
-    geminiService.generateTopic.mockRejectedValue(
+    geminiService.generateTopics.mockRejectedValue(
       new GeminiApiError('GEMINI_API_KEY가 설정되지 않았습니다.'),
     );
-    geminiService.evaluatePhoto.mockRejectedValue(
+    geminiService.evaluatePhotosBatch.mockRejectedValue(
       new GeminiApiError('GEMINI_API_KEY가 설정되지 않았습니다.'),
     );
-    imageUrlResolver.resolve.mockResolvedValue('https://example.com/photo.jpg');
 
     uploadsService.verifyUploadedImage.mockResolvedValue(undefined);
     uploadsService.createImageReadUrl.mockResolvedValue(
@@ -139,7 +127,6 @@ describe('GamesService', () => {
         { provide: DataSource, useValue: dataSource },
         { provide: GeminiService, useValue: geminiService },
         { provide: UploadsService, useValue: uploadsService },
-        { provide: ImageUrlResolver, useValue: imageUrlResolver },
       ],
     }).compile();
 
@@ -156,6 +143,13 @@ describe('GamesService', () => {
       relayCount: 2,
       timeLimitSeconds: 60,
     };
+
+    beforeEach(() => {
+      // estimateTotalTurns()가 트랜잭션 진입 전에 먼저 조회하는 값들의 기본값.
+      // (실제 검증은 트랜잭션 내부 로직이 담당하므로, 여기서는 대략적인 값이면 충분하다.)
+      roomRepository.findOneBy.mockResolvedValue(room);
+      memberRepository.count.mockResolvedValue(2);
+    });
 
     it('방장이 아니면 시작할 수 없다', async () => {
       roomRepository.findOne.mockResolvedValue(room);
@@ -220,7 +214,7 @@ describe('GamesService', () => {
       expect(result.topic).toBeNull();
     });
 
-    it('Topic 생성이 성공하면 GameSession에 topic을 저장한다', async () => {
+    it('Topic 배치 생성이 성공하면 게임당 1회 호출로 각 턴에 서로 다른 topic을 배정한다', async () => {
       // startGame()이 방 객체(room.status)를 직접 변경하므로,
       // 다른 테스트와 공유되는 참조가 아닌 복사본을 사용한다.
       roomRepository.findOne.mockResolvedValue({ ...room });
@@ -238,21 +232,29 @@ describe('GamesService', () => {
           joinedAt: new Date('2026-01-01T00:00:01Z'),
         },
       ]);
-      geminiService.generateTopic.mockResolvedValue({
-        topic: '오늘 가장 신나는 순간을 찍어보세요!',
+      geminiService.generateTopics.mockResolvedValue({
+        topics: ['주제1', '주제2', '주제3', '주제4'],
       });
 
       const result = await service.startGame(1, 10);
 
-      expect(result.topic).toBe('오늘 가장 신나는 순간을 찍어보세요!');
+      // 세션 topic은 배치로 만든 첫 topic을 재사용한다 (별도 호출 없음).
+      expect(result.topic).toBe('주제1');
       expect(gameRepository.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          topic: '오늘 가장 신나는 순간을 찍어보세요!',
-        }),
+        expect.objectContaining({ topic: '주제1' }),
       );
+      // 4턴(2명 × relayCount 2) 각각에 순서대로 topic이 배정된다.
+      expect(turnRepository.save).toHaveBeenCalledWith([
+        expect.objectContaining({ turnNumber: 1, topic: '주제1' }),
+        expect.objectContaining({ turnNumber: 2, topic: '주제2' }),
+        expect.objectContaining({ turnNumber: 3, topic: '주제3' }),
+        expect.objectContaining({ turnNumber: 4, topic: '주제4' }),
+      ]);
+      // 게임 시작 시 Topic 생성 Gemini 호출은 정확히 1회여야 한다 (턴마다 호출 아님).
+      expect(geminiService.generateTopics).toHaveBeenCalledTimes(1);
     });
 
-    it('Topic 생성 호출 자체가 실패해도 게임 시작에는 영향이 없다', async () => {
+    it('Topic 배치 생성 호출 자체가 실패해도 게임 시작에는 영향이 없다', async () => {
       roomRepository.findOne.mockResolvedValue({ ...room });
       memberRepository.find.mockResolvedValue([
         {
@@ -268,11 +270,42 @@ describe('GamesService', () => {
           joinedAt: new Date('2026-01-01T00:00:01Z'),
         },
       ]);
-      geminiService.generateTopic.mockRejectedValue(new Error('network'));
+      geminiService.generateTopics.mockRejectedValue(new Error('network'));
 
       await expect(service.startGame(1, 10)).resolves.toEqual(
         expect.objectContaining({ status: GameStatus.COUNTDOWN, topic: null }),
       );
+    });
+
+    it('배치로 생성된 topic 수가 실제 턴 수보다 적으면, 모자란 턴은 topic: null로 남는다', async () => {
+      roomRepository.findOne.mockResolvedValue({ ...room });
+      memberRepository.find.mockResolvedValue([
+        {
+          userId: 10,
+          isReady: false,
+          turnOrder: null,
+          joinedAt: new Date('2026-01-01T00:00:00Z'),
+        },
+        {
+          userId: 11,
+          isReady: true,
+          turnOrder: null,
+          joinedAt: new Date('2026-01-01T00:00:01Z'),
+        },
+      ]);
+      // 4턴이 필요하지만(2명 × relayCount 2) topic은 2개만 돌아온 경우
+      geminiService.generateTopics.mockResolvedValue({
+        topics: ['주제1', '주제2'],
+      });
+
+      await service.startGame(1, 10);
+
+      expect(turnRepository.save).toHaveBeenCalledWith([
+        expect.objectContaining({ turnNumber: 1, topic: '주제1' }),
+        expect.objectContaining({ turnNumber: 2, topic: '주제2' }),
+        expect.objectContaining({ turnNumber: 3, topic: null }),
+        expect.objectContaining({ turnNumber: 4, topic: null }),
+      ]);
     });
   });
 
@@ -287,10 +320,9 @@ describe('GamesService', () => {
       turnRepository.findOne.mockResolvedValue({
         turnNumber: 1,
         userId: 10,
+        // 게임 시작 시 배치로 미리 배정된 topic (턴 시작 시점에 별도로 생성하지 않는다).
+        topic: '주제1',
       });
-      const generateSpy = jest
-        .spyOn(internals(service), 'generateTurnTopicInBackground')
-        .mockImplementation(() => {});
 
       const result = await service.beginFirstTurn(5);
 
@@ -302,7 +334,6 @@ describe('GamesService', () => {
           userId: 10,
         }),
       );
-      expect(generateSpy).toHaveBeenCalledWith(5, 1);
       // 카운트다운 중 이탈로 1번 턴이 스킵됐을 수 있으므로, turnNumber 고정이 아니라
       // "가장 이른 WAITING 턴"을 찾는다.
       expect(turnRepository.findOne).toHaveBeenCalledWith({
@@ -311,19 +342,15 @@ describe('GamesService', () => {
       });
     });
 
-    it('중복 실행 방지로 null을 반환하면 Topic 생성을 트리거하지 않는다', async () => {
+    it('중복 실행 방지로 null을 반환한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         id: 5,
         status: GameStatus.IN_PROGRESS,
       });
-      const generateSpy = jest
-        .spyOn(internals(service), 'generateTurnTopicInBackground')
-        .mockImplementation(() => {});
 
       const result = await service.beginFirstTurn(5);
 
       expect(result).toBeNull();
-      expect(generateSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -378,24 +405,15 @@ describe('GamesService', () => {
       expect(result.nextTurn?.turnNumber).toBe(2);
       expect(result.nextTurn?.userId).toBe(11);
       expect(roomRepository.update).not.toHaveBeenCalled();
-      // 기존 응답 계약 유지: 내부적으로만 쓰이는 evaluation 필드가 새지 않아야 한다.
-      expect(result).not.toHaveProperty('evaluation');
     });
 
-    it('턴 제출은 AI 평가 완료를 기다리지 않고, "이 턴의" Topic으로 평가를 백그라운드에 위임한다', async () => {
-      gameRepository.findOne.mockResolvedValue({
-        ...game,
-        // 세션 전체 topic은 평가 기준으로 더 이상 쓰이지 않는다는 것을 명확히 하기 위해
-        // 턴의 topic과 다른 값으로 설정한다.
-        topic: '세션 topic(더 이상 평가에 쓰이지 않음)',
-      });
+    it('게임이 끝나지 않은 제출은 배치 평가를 트리거하지 않는다 (게임 종료 후에만 채점한다)', async () => {
+      gameRepository.findOne.mockResolvedValue({ ...game });
       turnRepository.findOneBy.mockResolvedValueOnce({
-        id: 101,
         gameSessionId: 5,
         turnNumber: 1,
         userId: 10,
         expiresAt: new Date(Date.now() + 60_000),
-        topic: '파란색 물건 찾아 찍기',
       });
       turnRepository.findOne.mockResolvedValueOnce({
         gameSessionId: 5,
@@ -403,44 +421,15 @@ describe('GamesService', () => {
         userId: 11,
       });
       const evaluateSpy = jest
-        .spyOn(internals(service), 'evaluateTurnInBackground')
-        .mockImplementation(() => {});
-
-      const result = await service.submitTurn(5, 10, 'key-1.jpg');
-
-      expect(evaluateSpy).toHaveBeenCalledWith(
-        101,
-        'key-1.jpg',
-        '파란색 물건 찾아 찍기',
-      );
-      // 평가 트리거는 결과가 반환되기 전에 이미 호출되어 있어야 한다 (제출을 막지 않음).
-      expect(result.finished).toBe(false);
-    });
-
-    it('다음 턴이 시작되면 그 턴의 개인 Topic 생성을 백그라운드로 트리거한다', async () => {
-      gameRepository.findOne.mockResolvedValue({ ...game });
-      turnRepository.findOneBy.mockResolvedValueOnce({
-        id: 101,
-        gameSessionId: 5,
-        turnNumber: 1,
-        userId: 10,
-        expiresAt: new Date(Date.now() + 60_000),
-      });
-      turnRepository.findOne.mockResolvedValueOnce({
-        gameSessionId: 5,
-        turnNumber: 2,
-        userId: 11,
-      });
-      const generateSpy = jest
-        .spyOn(internals(service), 'generateTurnTopicInBackground')
+        .spyOn(internals(service), 'evaluateGameInBackground')
         .mockImplementation(() => {});
 
       await service.submitTurn(5, 10, 'key-1.jpg');
 
-      expect(generateSpy).toHaveBeenCalledWith(5, 2);
+      expect(evaluateSpy).not.toHaveBeenCalled();
     });
 
-    it('마지막 턴이면 게임과 방을 종료 상태로 만들고, 더 이상 Topic을 생성하지 않는다', async () => {
+    it('마지막 턴 제출로 게임이 끝나면 방을 종료 상태로 만들고 배치 평가를 트리거한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         ...game,
         currentTurnNumber: 2,
@@ -451,8 +440,8 @@ describe('GamesService', () => {
         userId: 11,
         expiresAt: new Date(Date.now() + 60_000),
       });
-      const generateSpy = jest
-        .spyOn(internals(service), 'generateTurnTopicInBackground')
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateGameInBackground')
         .mockImplementation(() => {});
 
       const result = await service.submitTurn(5, 11, 'key-2.jpg');
@@ -462,7 +451,7 @@ describe('GamesService', () => {
       expect(roomRepository.update).toHaveBeenCalledWith(1, {
         status: RoomStatus.FINISHED,
       });
-      expect(generateSpy).not.toHaveBeenCalled();
+      expect(evaluateSpy).toHaveBeenCalledWith(5);
     });
 
     it('제한 시간이 지나면 제출을 거부한다', async () => {
@@ -514,7 +503,7 @@ describe('GamesService', () => {
       expect(result).toBeNull();
     });
 
-    it('제한 시간이 지난 턴을 만료시키고 다음 턴을 시작하며, 그 턴의 Topic 생성을 트리거한다', async () => {
+    it('제한 시간이 지난 턴을 만료시키고 다음 턴을 시작하며, 배치 평가는 트리거하지 않는다 (게임이 안 끝났으므로)', async () => {
       gameRepository.findOne.mockResolvedValue({
         id: 5,
         roomId: 1,
@@ -535,8 +524,8 @@ describe('GamesService', () => {
         turnNumber: 2,
         userId: 11,
       });
-      const generateSpy = jest
-        .spyOn(internals(service), 'generateTurnTopicInBackground')
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateGameInBackground')
         .mockImplementation(() => {});
 
       const result = await service.expireCurrentTurn(5);
@@ -546,10 +535,10 @@ describe('GamesService', () => {
       expect(turnRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({ status: GameTurnStatus.EXPIRED }),
       );
-      expect(generateSpy).toHaveBeenCalledWith(5, 2);
+      expect(evaluateSpy).not.toHaveBeenCalled();
     });
 
-    it('만료로 게임이 종료되면 더 이상 Topic을 생성하지 않는다', async () => {
+    it('만료로 게임이 종료되면 배치 평가를 트리거한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         id: 5,
         roomId: 1,
@@ -565,14 +554,14 @@ describe('GamesService', () => {
         status: GameTurnStatus.IN_PROGRESS,
         expiresAt: new Date(Date.now() - 1_000),
       });
-      const generateSpy = jest
-        .spyOn(internals(service), 'generateTurnTopicInBackground')
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateGameInBackground')
         .mockImplementation(() => {});
 
       const result = await service.expireCurrentTurn(5);
 
       expect(result?.finished).toBe(true);
-      expect(generateSpy).not.toHaveBeenCalled();
+      expect(evaluateSpy).toHaveBeenCalledWith(5);
     });
   });
 
@@ -846,6 +835,106 @@ describe('GamesService', () => {
       expect(result.finished).toBe(true);
       expect(result.remainingParticipants).toBe(0);
     });
+
+    it('인원 부족으로 즉시 종료되면 배치 평가를 트리거한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 3,
+        totalTurns: 6,
+        timeLimitSeconds: 60,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 1,
+        status: RoomStatus.IN_PROGRESS,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 1,
+        userId: 10,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(1);
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateGameInBackground')
+        .mockImplementation(() => {});
+
+      await service.leaveActiveGame(5, 10);
+
+      expect(evaluateSpy).toHaveBeenCalledWith(5);
+    });
+
+    it('게임이 계속되면(잔여 인원 충분) 배치 평가를 트리거하지 않는다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 3,
+        totalTurns: 9,
+        timeLimitSeconds: 60,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 1,
+        status: RoomStatus.IN_PROGRESS,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 1,
+        userId: 12,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(3);
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 3,
+        userId: 10,
+        status: GameTurnStatus.IN_PROGRESS,
+      });
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateGameInBackground')
+        .mockImplementation(() => {});
+
+      await service.leaveActiveGame(5, 12);
+
+      expect(evaluateSpy).not.toHaveBeenCalled();
+    });
+
+    it('이탈자의 마지막 턴 진행으로 게임이 자연 종료되면(잔여 인원은 충분해도) 배치 평가를 트리거한다', async () => {
+      gameRepository.findOne.mockResolvedValue({
+        id: 5,
+        roomId: 1,
+        status: GameStatus.IN_PROGRESS,
+        currentTurnNumber: 9,
+        totalTurns: 9,
+        timeLimitSeconds: 60,
+      });
+      roomRepository.findOne.mockResolvedValue({
+        id: 1,
+        status: RoomStatus.IN_PROGRESS,
+      });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 1,
+        userId: 10,
+        leftAt: null,
+      });
+      memberRepository.count.mockResolvedValue(2);
+      // 이탈자(10)가 마지막(9번) 턴의 당사자 - 만료 처리 후 advanceTurn이 다음 턴을
+      // 찾지 못해(turnRepository.find가 undefined 반환) 자연 종료된다.
+      turnRepository.findOneBy.mockResolvedValueOnce({
+        gameSessionId: 5,
+        turnNumber: 9,
+        userId: 10,
+        status: GameTurnStatus.IN_PROGRESS,
+      });
+      const evaluateSpy = jest
+        .spyOn(internals(service), 'evaluateGameInBackground')
+        .mockImplementation(() => {});
+
+      const result = await service.leaveActiveGame(5, 10);
+
+      expect(result.finished).toBe(false);
+      expect(result.turnAdvance?.finished).toBe(true);
+      expect(evaluateSpy).toHaveBeenCalledWith(5);
+    });
   });
 
   describe('findResumableSessions (서버 재시작 후 타이머 복구용)', () => {
@@ -906,98 +995,201 @@ describe('GamesService', () => {
     });
   });
 
-  describe('runTurnEvaluation (AI 채점)', () => {
-    it('평가에 성공하면 GameTurn에 score/feedback을 COMPLETED로 저장한다', async () => {
-      imageUrlResolver.resolve.mockResolvedValue(
-        'https://example.com/photo.jpg',
-      );
-      geminiService.evaluatePhoto.mockResolvedValue({
-        score: 80,
-        feedback: '주제와 잘 어울려요.',
-      });
-
-      await internals(service).runTurnEvaluation(101, 'key.jpg', '오늘의 하늘');
-
-      expect(imageUrlResolver.resolve).toHaveBeenCalledWith('key.jpg');
-      expect(geminiService.evaluatePhoto).toHaveBeenCalledWith({
-        imageUrl: 'https://example.com/photo.jpg',
+  describe('runGameEvaluation (게임 종료 후 배치 AI 채점)', () => {
+    function turnFixture(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 101,
+        gameSessionId: 5,
+        turnNumber: 1,
+        userId: 10,
+        status: GameTurnStatus.SUBMITTED,
+        aiEvaluationStatus: GameTurnEvaluationStatus.PENDING,
+        imageKey: 'key.jpg',
         topic: '오늘의 하늘',
-      });
+        ...overrides,
+      };
+    }
+
+    it('평가할 SUBMITTED+PENDING 턴이 없으면 아무 것도 하지 않는다', async () => {
+      turnRepository.find.mockResolvedValue([]);
+
+      await internals(service).runGameEvaluation(5);
+
+      expect(geminiService.evaluatePhotosBatch).not.toHaveBeenCalled();
+      expect(turnRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('사진 여러 장을 1회의 배치 호출로 채점하고, 점수는 backend에서 합산해 저장한다', async () => {
+      turnRepository.find.mockResolvedValue([
+        turnFixture({ id: 101, topic: '주제1' }),
+        turnFixture({ id: 102, topic: '주제2' }),
+      ]);
+      geminiService.evaluatePhotosBatch.mockResolvedValue([
+        {
+          turnIndex: 1,
+          relevance: 42,
+          expression: 25,
+          creativity: 16,
+          feedback: '좋아요',
+        },
+        {
+          turnIndex: 2,
+          relevance: 30,
+          expression: 20,
+          creativity: 10,
+          feedback: '괜찮아요',
+        },
+      ]);
+
+      await internals(service).runGameEvaluation(5);
+
+      // 사진 2장이어도 Gemini 호출은 1회(청크 크기 이내)
+      expect(geminiService.evaluatePhotosBatch).toHaveBeenCalledTimes(1);
       expect(turnRepository.update).toHaveBeenCalledWith(
         101,
         expect.objectContaining({
-          aiScore: 80,
-          aiFeedback: '주제와 잘 어울려요.',
+          aiScore: 83, // 42 + 25 + 16 (Gemini가 아닌 backend가 합산)
+          aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+        }),
+      );
+      expect(turnRepository.update).toHaveBeenCalledWith(
+        102,
+        expect.objectContaining({
+          aiScore: 60, // 30 + 20 + 10
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
         }),
       );
     });
 
-    it('AI 호출이 실패하면 예외를 던지지 않고 FAILED로 저장한다', async () => {
-      imageUrlResolver.resolve.mockResolvedValue(
-        'https://example.com/photo.jpg',
+    it('topic이 없는 턴은 평가 대상에서 제외하고 즉시 FAILED로 남긴다', async () => {
+      turnRepository.find.mockResolvedValue([
+        turnFixture({ id: 101, topic: null }),
+      ]);
+
+      await internals(service).runGameEvaluation(5);
+
+      expect(geminiService.evaluatePhotosBatch).not.toHaveBeenCalled();
+      expect(turnRepository.update).toHaveBeenCalledWith([101], {
+        aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
+      });
+    });
+
+    it('청크 크기(10)를 넘으면 여러 번 나눠 호출한다', async () => {
+      const turns = Array.from({ length: 12 }, (_, index) =>
+        turnFixture({ id: 200 + index }),
       );
-      geminiService.evaluatePhoto.mockRejectedValue(
+      turnRepository.find.mockResolvedValue(turns);
+      const chunkSizes: number[] = [];
+
+      geminiService.evaluatePhotosBatch.mockImplementation(
+        (items: { turnIndex: number }[]) => {
+          chunkSizes.push(items.length);
+
+          return Promise.resolve(
+            items.map((item) => ({
+              turnIndex: item.turnIndex,
+              relevance: 10,
+              expression: 10,
+              creativity: 10,
+              feedback: '피드백',
+            })),
+          );
+        },
+      );
+
+      await internals(service).runGameEvaluation(5);
+
+      expect(geminiService.evaluatePhotosBatch).toHaveBeenCalledTimes(2);
+      expect(chunkSizes).toEqual([10, 2]);
+    });
+
+    it('배치 호출 자체가 실패해도 예외를 던지지 않고, 해당 청크는 FAILED로 남긴다', async () => {
+      turnRepository.find.mockResolvedValue([
+        turnFixture({ id: 101 }),
+        turnFixture({ id: 102 }),
+      ]);
+      geminiService.evaluatePhotosBatch.mockRejectedValue(
         new GeminiApiError('사진 평가 요청에 실패했습니다.'),
       );
 
       await expect(
-        internals(service).runTurnEvaluation(101, 'key.jpg', '오늘의 하늘'),
+        internals(service).runGameEvaluation(5),
       ).resolves.toBeUndefined();
 
-      expect(turnRepository.update).toHaveBeenCalledWith(101, {
+      expect(turnRepository.update).toHaveBeenCalledWith([101, 102], {
         aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
       });
     });
 
-    it('이미지 URL 해석이 실패해도 예외를 던지지 않고 FAILED로 저장한다', async () => {
-      imageUrlResolver.resolve.mockRejectedValue(
-        new Error('S3 이미지 URL 변환이 아직 연동되지 않았습니다.'),
+    it('응답에 없는(누락된) turnIndex는 FAILED로 남긴다', async () => {
+      turnRepository.find.mockResolvedValue([
+        turnFixture({ id: 101 }),
+        turnFixture({ id: 102 }),
+      ]);
+      geminiService.evaluatePhotosBatch.mockResolvedValue([
+        {
+          turnIndex: 1,
+          relevance: 10,
+          expression: 10,
+          creativity: 10,
+          feedback: '피드백',
+        },
+        // turnIndex 2(=turnId 102)는 응답에서 누락됨
+      ]);
+
+      await internals(service).runGameEvaluation(5);
+
+      expect(turnRepository.update).toHaveBeenCalledWith(
+        101,
+        expect.objectContaining({
+          aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+        }),
       );
-
-      await expect(
-        internals(service).runTurnEvaluation(101, 'key.jpg', '오늘의 하늘'),
-      ).resolves.toBeUndefined();
-
-      expect(geminiService.evaluatePhoto).not.toHaveBeenCalled();
-      expect(turnRepository.update).toHaveBeenCalledWith(101, {
-        aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
-      });
-    });
-
-    it('Topic이 없으면 평가를 시도하지 않고 FAILED로 남긴다', async () => {
-      await internals(service).runTurnEvaluation(101, 'key.jpg', null);
-
-      expect(imageUrlResolver.resolve).not.toHaveBeenCalled();
-      expect(geminiService.evaluatePhoto).not.toHaveBeenCalled();
-      expect(turnRepository.update).toHaveBeenCalledWith(101, {
+      expect(turnRepository.update).toHaveBeenCalledWith([102], {
         aiEvaluationStatus: GameTurnEvaluationStatus.FAILED,
       });
     });
   });
 
-  describe('runTurnTopicGeneration (턴별 개인 Topic 생성)', () => {
-    it('Topic 생성에 성공하면 해당 턴에 저장한다', async () => {
-      geminiService.generateTopic.mockResolvedValue({
-        topic: '파란색 물건 찾아 찍기',
-      });
+  describe('estimateTotalTurns / generateTopicsSafely (Topic 배치 생성 준비)', () => {
+    it('estimateTotalTurns는 활성 참여자 수 × relayCount를 반환한다', async () => {
+      roomRepository.findOneBy.mockResolvedValue({ relayCount: 3 });
+      memberRepository.count.mockResolvedValue(4);
 
-      await internals(service).runTurnTopicGeneration(5, 3);
+      await expect(internals(service).estimateTotalTurns(1)).resolves.toBe(12);
+    });
 
-      expect(turnRepository.update).toHaveBeenCalledWith(
-        { gameSessionId: 5, turnNumber: 3 },
-        { topic: '파란색 물건 찾아 찍기' },
+    it('estimateTotalTurns는 방이 없으면 NotFoundException을 던진다', async () => {
+      roomRepository.findOneBy.mockResolvedValue(null);
+
+      await expect(internals(service).estimateTotalTurns(1)).rejects.toThrow(
+        NotFoundException,
       );
     });
 
-    it('Topic 생성이 실패해도 예외를 던지지 않고, 저장도 시도하지 않는다', async () => {
-      geminiService.generateTopic.mockRejectedValue(new Error('network'));
+    it('generateTopicsSafely는 성공하면 topics 배열을 반환한다', async () => {
+      geminiService.generateTopics.mockResolvedValue({
+        topics: ['주제1', '주제2'],
+      });
 
-      await expect(
-        internals(service).runTurnTopicGeneration(5, 3),
-      ).resolves.toBeUndefined();
+      await expect(internals(service).generateTopicsSafely(2)).resolves.toEqual(
+        ['주제1', '주제2'],
+      );
+    });
 
-      expect(turnRepository.update).not.toHaveBeenCalled();
+    it('generateTopicsSafely는 실패해도 예외를 던지지 않고 빈 배열을 반환한다', async () => {
+      geminiService.generateTopics.mockRejectedValue(new Error('network'));
+
+      await expect(internals(service).generateTopicsSafely(2)).resolves.toEqual(
+        [],
+      );
+    });
+
+    it('generateTopicsSafely는 count가 0 이하면 Gemini를 호출하지 않는다', async () => {
+      await expect(internals(service).generateTopicsSafely(0)).resolves.toEqual(
+        [],
+      );
+      expect(geminiService.generateTopics).not.toHaveBeenCalled();
     });
   });
 
@@ -1164,7 +1356,7 @@ describe('GamesService', () => {
       expect(otherResult.currentTurn?.userId).toBe(10);
     });
 
-    it('게임 결과에 topic, 턴별 score/feedback, 참가자별 총점·순위를 포함한다 (동점은 공동 순위)', async () => {
+    it('게임 결과에 topic, 턴별 score/feedback, 참가자별 평균점수·순위를 포함한다 (동점은 공동 순위, 제출 수가 달라도 평균으로 공정하게 비교)', async () => {
       const turns = [
         {
           turnNumber: 1,
@@ -1174,7 +1366,7 @@ describe('GamesService', () => {
           imageKey: 'a.jpg',
           submittedAt: new Date('2026-01-01T00:00:01Z'),
           topic: '주변에서 웃는 얼굴처럼 보이는 물건 찾아 찍기',
-          aiScore: 80,
+          aiScore: 90,
           aiFeedback: '좋아요',
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
         },
@@ -1185,7 +1377,7 @@ describe('GamesService', () => {
           status: GameTurnStatus.SUBMITTED,
           imageKey: 'b.jpg',
           submittedAt: new Date('2026-01-01T00:00:02Z'),
-          aiScore: 20,
+          aiScore: 60,
           aiFeedback: '아쉬워요',
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
         },
@@ -1196,7 +1388,7 @@ describe('GamesService', () => {
           status: GameTurnStatus.SUBMITTED,
           imageKey: 'c.jpg',
           submittedAt: new Date('2026-01-01T00:00:03Z'),
-          aiScore: 20,
+          aiScore: 70,
           aiFeedback: '보통이에요',
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
         },
@@ -1207,18 +1399,20 @@ describe('GamesService', () => {
           status: GameTurnStatus.SUBMITTED,
           imageKey: 'd.jpg',
           submittedAt: new Date('2026-01-01T00:00:04Z'),
-          aiScore: 80,
+          aiScore: 100,
           aiFeedback: '멋져요',
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
         },
         {
+          // 이탈 없이 참여했지만 제출 1건뿐인 참가자: 총점(sum) 기준이라면 불리하지만
+          // 평균 기준이므로 2건 제출한 참가자들과 공정하게 비교된다.
           turnNumber: 5,
           userId: 12,
           user: { nickname: '지훈', profileImageUrl: null },
           status: GameTurnStatus.SUBMITTED,
           imageKey: 'e.jpg',
           submittedAt: new Date('2026-01-01T00:00:05Z'),
-          aiScore: 50,
+          aiScore: 70,
           aiFeedback: '괜찮아요',
           aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
         },
@@ -1273,7 +1467,7 @@ describe('GamesService', () => {
           turnNumber: 1,
           // 게임 종료 후에는 모든 참가자의 개인(턴별) Topic이 공개되어야 한다.
           topic: '주변에서 웃는 얼굴처럼 보이는 물건 찾아 찍기',
-          score: 80,
+          score: 90,
           feedback: '좋아요',
         }),
       );
@@ -1296,11 +1490,12 @@ describe('GamesService', () => {
         }),
       );
 
-      // 수연(100) == 민준(100) > 지훈(50): 표준 경쟁 순위(1,1,3)
+      // 수연 평균(90+70)/2=80 == 민준 평균(60+100)/2=80 > 지훈 평균 70/1=70(1건 제출)
+      // : 표준 경쟁 순위(1,1,3). totalScore는 필드명 그대로지만 값은 평균이다.
       expect(result.ranking).toEqual([
-        { userId: 10, nickname: '수연', totalScore: 100, rank: 1 },
-        { userId: 11, nickname: '민준', totalScore: 100, rank: 1 },
-        { userId: 12, nickname: '지훈', totalScore: 50, rank: 3 },
+        { userId: 10, nickname: '수연', totalScore: 80, rank: 1 },
+        { userId: 11, nickname: '민준', totalScore: 80, rank: 1 },
+        { userId: 12, nickname: '지훈', totalScore: 70, rank: 3 },
       ]);
     });
 

@@ -6,7 +6,6 @@ import { RoomsModule } from '../rooms/rooms.module';
 import { AiModule } from '../ai/ai.module';
 import { GameSession } from './entities/game-session.entity';
 import { GameTurn } from './entities/game-turn.entity';
-import { ImageUrlResolver } from './image-url.resolver';
 import { UploadsModule } from '../uploads/uploads.module';
 
 @Module({
@@ -17,7 +16,7 @@ import { UploadsModule } from '../uploads/uploads.module';
     UploadsModule,
   ],
   controllers: [GamesController],
-  providers: [GamesService, ImageUrlResolver],
+  providers: [GamesService],
   exports: [GamesService],
 })
 export class GamesModule {}
