@@ -5,6 +5,7 @@ import { Room } from '../project/rooms/entities/room.entity';
 import { RoomMember } from '../project/rooms/entities/room-member.entity';
 import { GameSession } from '../project/games/entities/game-session.entity';
 import { GameTurn } from '../project/games/entities/game-turn.entity';
+import { ChatMessage } from '../project/chat/entities/chat-message.entity';
 
 const AppDataSource = new DataSource({
   type: 'postgres',
@@ -15,7 +16,7 @@ const AppDataSource = new DataSource({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_DATABASE,
 
-  entities: [User, Room, RoomMember, GameSession, GameTurn],
+  entities: [User, Room, RoomMember, GameSession, GameTurn, ChatMessage],
 
   migrations: [__dirname + '/migrations/*{.ts,.js}'],
 

@@ -10,6 +10,7 @@ import {
 import { Namespace } from 'socket.io';
 import { LobbyRealtimeHandler } from './handlers/lobby-realtime.handler';
 import { GameRealtimeHandler } from './handlers/game-realtime.handler';
+import { ChatRealtimeHandler } from './handlers/chat-realtime.handler';
 import { RealtimeAuthService } from './security/realtime-auth.service';
 import type { RealtimeSocket } from './types/realtime-socket.type';
 import { Logger, UseFilters, UsePipes, ValidationPipe } from '@nestjs/common';
@@ -20,6 +21,8 @@ import { StartGameDto } from './dto/start-game.dto';
 import { SubscribeGameDto } from './dto/subscribe-game.dto';
 import { SubmitGameTurnDto } from './dto/submit-game-turn.dto';
 import { LeaveGameDto } from './dto/leave-game.dto';
+import { SendGlobalChatMessageDto } from '../chat/dto/send-global-chat-message.dto';
+import { SendRoomChatMessageDto } from '../chat/dto/send-room-chat-message.dto';
 import { WsHttpExceptionFilter } from './filters/ws-http-exception.filter';
 
 @WebSocketGateway({
@@ -52,6 +55,7 @@ export class RealtimeGateway implements OnGatewayDisconnect {
   constructor(
     private readonly lobbyHandler: LobbyRealtimeHandler,
     private readonly gameHandler: GameRealtimeHandler,
+    private readonly chatHandler: ChatRealtimeHandler,
     private readonly realtimeAuthService: RealtimeAuthService,
   ) {}
 
@@ -61,8 +65,12 @@ export class RealtimeGateway implements OnGatewayDisconnect {
 
       void this.realtimeAuthService
         .authenticate(client)
-        .then((userId) => {
+        .then(async (userId) => {
           client.data.userId = userId;
+
+          // 전체 채팅은 연결되는 즉시 자동 참여한다 (별도 subscribe 이벤트 없음).
+          await client.join(this.globalChatChannel());
+
           next();
         })
         .catch(() => {
@@ -115,6 +123,10 @@ export class RealtimeGateway implements OnGatewayDisconnect {
 
     // Socket.IO 채널 참여
     await this.moveChannel(client, channel);
+
+    // 방 채팅 채널은 로비/게임 화면 전환과 무관하게 별도로 유지된다 (게임 진행 중에도
+    // 끊기지 않고, 재게임으로 같은 방에서 새 게임이 시작돼도 새로 join할 필요 없음).
+    await client.join(this.roomChatChannel(body.roomId));
 
     // 새 사용자 본인을 제외한 기존 사용자에게 전송
     client.to(channel).emit('lobby:member-joined', joinedMember);
@@ -279,6 +291,9 @@ export class RealtimeGateway implements OnGatewayDisconnect {
     // Socket.IO 대기실 채널 구독 해제
     await client.leave(channel);
 
+    // 더 이상 이 방의 참여자가 아니므로 방 채팅도 함께 나간다.
+    await client.leave(this.roomChatChannel(body.roomId));
+
     if (client.data.activeSessionChannel === channel) {
       delete client.data.activeSessionChannel;
     }
@@ -347,6 +362,9 @@ export class RealtimeGateway implements OnGatewayDisconnect {
     const state = await this.gameHandler.getSessionState(body.gameId, userId);
 
     await this.moveChannel(client, this.gameChannel(body.gameId));
+
+    // 재접속(새로고침 등)으로 게임 화면을 통해 처음 들어온 경우에도 방 채팅에 참여한다.
+    await client.join(this.roomChatChannel(state.roomId));
 
     client.emit('game:state', state);
 
@@ -417,6 +435,9 @@ export class RealtimeGateway implements OnGatewayDisconnect {
 
     await client.leave(channel);
 
+    // 게임 도중 이탈은 방 참여 자체를 종료시키므로(leaveActiveGame), 방 채팅도 함께 나간다.
+    await client.leave(this.roomChatChannel(result.roomId));
+
     if (client.data.activeSessionChannel === channel) {
       delete client.data.activeSessionChannel;
     }
@@ -424,6 +445,67 @@ export class RealtimeGateway implements OnGatewayDisconnect {
     return {
       success: true,
       ...result,
+    };
+  }
+
+  // 전체 채팅 메시지 전송 - 연결된 모든 소켓에게 방송한다 (afterInit에서 자동 참여).
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  )
+  @SubscribeMessage('chat:global:send')
+  async sendGlobalChatMessage(
+    @ConnectedSocket() client: RealtimeSocket,
+    @MessageBody() body: SendGlobalChatMessageDto,
+  ) {
+    const userId = this.getUserId(client);
+
+    const message = await this.chatHandler.sendGlobalMessage(
+      userId,
+      body.content,
+    );
+
+    this.server
+      .to(this.globalChatChannel())
+      .emit('chat:global:message', message);
+
+    return {
+      success: true,
+      message,
+    };
+  }
+
+  // 게임방 채팅 메시지 전송 - 같은 방 채팅 채널(lobby:subscribe/game:subscribe에서
+  // 자동 참여)에 있는 참여자에게만 방송한다. 전체 채팅과 완전히 분리된 채널이다.
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+    }),
+  )
+  @SubscribeMessage('chat:room:send')
+  async sendRoomChatMessage(
+    @ConnectedSocket() client: RealtimeSocket,
+    @MessageBody() body: SendRoomChatMessageDto,
+  ) {
+    const userId = this.getUserId(client);
+    const channel = this.roomChatChannel(body.roomId);
+
+    this.validateChannel(client, channel);
+
+    const message = await this.chatHandler.sendRoomMessage(
+      body.roomId,
+      userId,
+      body.content,
+    );
+
+    this.server.to(channel).emit('chat:room:message', message);
+
+    return {
+      success: true,
+      message,
     };
   }
 
@@ -674,6 +756,16 @@ export class RealtimeGateway implements OnGatewayDisconnect {
 
   private gameChannel(gameId: number): string {
     return `game:${gameId}`;
+  }
+
+  private globalChatChannel(): string {
+    return 'chat:global';
+  }
+
+  // 방 채팅 채널은 gameId가 아니라 roomId 기준이다 — lobby/game 화면 전환(moveChannel)과
+  // 독립적으로 유지되어, 게임 진행 중에도 끊기지 않고 재게임 시에도 새로 join할 필요가 없다.
+  private roomChatChannel(roomId: number): string {
+    return `chat:room:${roomId}`;
   }
 
   private async moveChannel(

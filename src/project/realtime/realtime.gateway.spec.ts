@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { RealtimeGateway } from './realtime.gateway';
 import { LobbyRealtimeHandler } from './handlers/lobby-realtime.handler';
 import { GameRealtimeHandler } from './handlers/game-realtime.handler';
+import { ChatRealtimeHandler } from './handlers/chat-realtime.handler';
 import { RealtimeAuthService } from './security/realtime-auth.service';
 
 interface RealtimeGatewayInternals {
@@ -16,6 +17,10 @@ describe('RealtimeGateway - 서버 재시작 시 게임 타이머 복구', () =>
   let gateway: RealtimeGateway;
 
   const lobbyHandler = {};
+  const chatHandler = {
+    sendGlobalMessage: jest.fn(),
+    sendRoomMessage: jest.fn(),
+  };
   const gameHandler = {
     findResumableSessions: jest.fn(),
     beginFirstTurn: jest.fn(),
@@ -35,6 +40,7 @@ describe('RealtimeGateway - 서버 재시작 시 게임 타이머 복구', () =>
         RealtimeGateway,
         { provide: LobbyRealtimeHandler, useValue: lobbyHandler },
         { provide: GameRealtimeHandler, useValue: gameHandler },
+        { provide: ChatRealtimeHandler, useValue: chatHandler },
         { provide: RealtimeAuthService, useValue: realtimeAuthService },
       ],
     }).compile();
@@ -129,6 +135,7 @@ interface FakeRealtimeSocket {
   join: jest.Mock;
   leave: jest.Mock;
   emit: jest.Mock;
+  to: jest.Mock;
 }
 
 function createFakeSocket(
@@ -141,6 +148,7 @@ function createFakeSocket(
     join: jest.fn(),
     leave: jest.fn(),
     emit: jest.fn(),
+    to: jest.fn(() => ({ emit: jest.fn() })),
   };
 }
 
@@ -148,6 +156,10 @@ describe('RealtimeGateway - 게임 중 이탈 처리 (game:leave / disconnect)',
   let gateway: RealtimeGateway;
 
   const lobbyHandler = {};
+  const chatHandler = {
+    sendGlobalMessage: jest.fn(),
+    sendRoomMessage: jest.fn(),
+  };
   const gameHandler = {
     findResumableSessions: jest.fn(),
     leaveActiveGame: jest.fn(),
@@ -174,6 +186,7 @@ describe('RealtimeGateway - 게임 중 이탈 처리 (game:leave / disconnect)',
         RealtimeGateway,
         { provide: LobbyRealtimeHandler, useValue: lobbyHandler },
         { provide: GameRealtimeHandler, useValue: gameHandler },
+        { provide: ChatRealtimeHandler, useValue: chatHandler },
         { provide: RealtimeAuthService, useValue: realtimeAuthService },
       ],
     }).compile();
@@ -353,5 +366,169 @@ describe('RealtimeGateway - 게임 중 이탈 처리 (game:leave / disconnect)',
     await expect(
       jest.advanceTimersByTimeAsync(15_000),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('RealtimeGateway - 채팅 (chat:global / chat:room)', () => {
+  let gateway: RealtimeGateway;
+
+  const lobbyHandler = {
+    subscribe: jest.fn(),
+    leaveRoom: jest.fn(),
+  };
+  const gameHandler = {
+    findResumableSessions: jest.fn(),
+    getSessionState: jest.fn(),
+    leaveActiveGame: jest.fn(),
+  };
+  const chatHandler = {
+    sendGlobalMessage: jest.fn(),
+    sendRoomMessage: jest.fn(),
+  };
+  const realtimeAuthService = { authenticate: jest.fn() };
+  const emit = jest.fn();
+  const server = {
+    to: jest.fn(() => ({ emit })),
+    in: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    jest.resetAllMocks();
+    server.to.mockImplementation(() => ({ emit }));
+    server.in.mockImplementation(() => ({
+      fetchSockets: jest.fn().mockResolvedValue([]),
+    }));
+    gameHandler.findResumableSessions.mockResolvedValue([]);
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        RealtimeGateway,
+        { provide: LobbyRealtimeHandler, useValue: lobbyHandler },
+        { provide: GameRealtimeHandler, useValue: gameHandler },
+        { provide: ChatRealtimeHandler, useValue: chatHandler },
+        { provide: RealtimeAuthService, useValue: realtimeAuthService },
+      ],
+    }).compile();
+
+    gateway = module.get<RealtimeGateway>(RealtimeGateway);
+    gateway.server = server as never;
+  });
+
+  it('chat:global:send는 chat:global 채널 전체에 방송한다', async () => {
+    chatHandler.sendGlobalMessage.mockResolvedValue({
+      id: 1,
+      roomId: null,
+      userId: 5,
+      nickname: '수연',
+      profileImageUrl: null,
+      content: '안녕하세요',
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+    });
+    const client = createFakeSocket(5);
+
+    const result = await gateway.sendGlobalChatMessage(client as never, {
+      content: '안녕하세요',
+    });
+
+    expect(chatHandler.sendGlobalMessage).toHaveBeenCalledWith(5, '안녕하세요');
+    expect(server.to).toHaveBeenCalledWith('chat:global');
+    expect(emit).toHaveBeenCalledWith(
+      'chat:global:message',
+      expect.objectContaining({ content: '안녕하세요' }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('chat:room:send는 방 채팅 채널(chat:room:{roomId})에 참여 중이어야 하며, 전체 채팅과 분리된 채널에 방송한다', async () => {
+    chatHandler.sendRoomMessage.mockResolvedValue({
+      id: 2,
+      roomId: 7,
+      userId: 5,
+      nickname: '수연',
+      profileImageUrl: null,
+      content: '방 채팅',
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+    });
+    const client = createFakeSocket(5, 'chat:room:7');
+
+    const result = await gateway.sendRoomChatMessage(client as never, {
+      roomId: 7,
+      content: '방 채팅',
+    });
+
+    expect(chatHandler.sendRoomMessage).toHaveBeenCalledWith(7, 5, '방 채팅');
+    expect(server.to).toHaveBeenCalledWith('chat:room:7');
+    expect(emit).toHaveBeenCalledWith(
+      'chat:room:message',
+      expect.objectContaining({ roomId: 7, content: '방 채팅' }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('chat:room:send는 해당 방 채팅 채널에 참여하고 있지 않으면 거부한다 (전체 채팅과 대상이 섞이지 않음)', async () => {
+    const client = createFakeSocket(5, 'chat:global');
+
+    await expect(
+      gateway.sendRoomChatMessage(client as never, {
+        roomId: 7,
+        content: '방 채팅',
+      }),
+    ).rejects.toThrow();
+    expect(chatHandler.sendRoomMessage).not.toHaveBeenCalled();
+  });
+
+  it('lobby:subscribe 시 로비 채널과 별개로 방 채팅 채널(chat:room:{roomId})에도 자동 참여한다', async () => {
+    lobbyHandler.subscribe.mockResolvedValue({ userId: 5, nickname: '수연' });
+    const client = createFakeSocket(5);
+
+    await gateway.subscribeLobby(client as never, { roomId: 7 });
+
+    expect(client.join).toHaveBeenCalledWith('lobby:7');
+    expect(client.join).toHaveBeenCalledWith('chat:room:7');
+  });
+
+  it('game:subscribe 시(재접속 포함) 게임 채널과 별개로 방 채팅 채널에도 참여한다', async () => {
+    gameHandler.getSessionState.mockResolvedValue({ gameId: 1, roomId: 7 });
+    const client = createFakeSocket(5);
+
+    await gateway.subscribeGame(client as never, { gameId: 1 });
+
+    expect(client.join).toHaveBeenCalledWith('game:1');
+    expect(client.join).toHaveBeenCalledWith('chat:room:7');
+  });
+
+  it('lobby:leave 시 로비 채널과 함께 방 채팅 채널에서도 나간다', async () => {
+    lobbyHandler.leaveRoom.mockResolvedValue({
+      roomId: 7,
+      leftUserId: 5,
+      currentParticipants: 1,
+      roomDeleted: false,
+      hostChanged: false,
+      previousHostId: null,
+      newHostId: null,
+    });
+    const client = createFakeSocket(5, 'lobby:7');
+
+    await gateway.leaveLobby(client as never, { roomId: 7 });
+
+    expect(client.leave).toHaveBeenCalledWith('lobby:7');
+    expect(client.leave).toHaveBeenCalledWith('chat:room:7');
+  });
+
+  it('game:leave 시 게임 채널과 함께 방 채팅 채널에서도 나간다 (방 참여 자체가 종료되므로)', async () => {
+    gameHandler.leaveActiveGame.mockResolvedValue({
+      finished: true,
+      gameId: 1,
+      roomId: 7,
+      leftUserId: 5,
+      remainingParticipants: 1,
+      turnAdvance: null,
+    });
+    const client = createFakeSocket(5, 'game:1');
+
+    await gateway.leaveGame(client as never, { gameId: 1 });
+
+    expect(client.leave).toHaveBeenCalledWith('game:1');
+    expect(client.leave).toHaveBeenCalledWith('chat:room:7');
   });
 });
