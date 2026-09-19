@@ -60,11 +60,13 @@ jobs:
           COMPOSE_SOURCE="docker-compose-server.yml"
           DEPLOY_SOURCE="deploy.sh"
           NGINX_SOURCE="nginx/default.conf"
+          BACKUP_SOURCE="scripts/backup-db.sh"
 
           for FILE in \
             "${COMPOSE_SOURCE}" \
             "${DEPLOY_SOURCE}" \
-            "${NGINX_SOURCE}"; do
+            "${NGINX_SOURCE}" \
+            "${BACKUP_SOURCE}"; do
 
             if [ ! -s "${FILE}" ]; then
               echo "${FILE} 파일을 찾을 수 없거나 비어 있습니다."
@@ -75,35 +77,44 @@ jobs:
           COMPOSE_B64="$(base64 -w 0 "${COMPOSE_SOURCE}")"
           DEPLOY_B64="$(base64 -w 0 "${DEPLOY_SOURCE}")"
           NGINX_B64="$(base64 -w 0 "${NGINX_SOURCE}")"
+          BACKUP_B64="$(base64 -w 0 "${BACKUP_SOURCE}")"
 
           PARAMETERS="$(jq -nc \
             --arg compose "${COMPOSE_B64}" \
             --arg deploy "${DEPLOY_B64}" \
             --arg nginx "${NGINX_B64}" \
+            --arg backup "${BACKUP_B64}" \
             --arg service "${SERVICE}" \
             '{
               commands: [
                 "set -euo pipefail",
 
-                "trap \"rm -f /tmp/docker-compose-server.yml /tmp/deploy.sh /tmp/default.conf\" EXIT",
+                "trap \"rm -f /tmp/docker-compose-server.yml /tmp/deploy.sh /tmp/default.conf /tmp/backup-db.sh\" EXIT",
 
                 ("printf %s " + ($compose | @sh) + " | base64 -d > /tmp/docker-compose-server.yml"),
                 ("printf %s " + ($deploy | @sh) + " | base64 -d > /tmp/deploy.sh"),
                 ("printf %s " + ($nginx | @sh) + " | base64 -d > /tmp/default.conf"),
+                ("printf %s " + ($backup | @sh) + " | base64 -d > /tmp/backup-db.sh"),
 
                 "bash -n /tmp/deploy.sh",
+                "bash -n /tmp/backup-db.sh",
 
                 "install -o ec2-user -g ec2-user -m 0644 /tmp/docker-compose-server.yml /opt/app/docker-compose-server.yml.new",
                 "install -o ec2-user -g ec2-user -m 0755 /tmp/deploy.sh /opt/app/deploy.sh.new",
                 "install -o ec2-user -g ec2-user -m 0644 /tmp/default.conf /opt/app/nginx/default.conf.new",
+                "install -o ec2-user -g ec2-user -m 0700 /tmp/backup-db.sh /opt/app/backup-db.sh.new",
 
                 "if [ -f /opt/app/.env ]; then sudo -u ec2-user docker compose --env-file /opt/app/.env -f /opt/app/docker-compose-server.yml.new config --quiet; fi",
 
                 "if [ -f /opt/app/docker-compose-server.yml ]; then cp -a /opt/app/docker-compose-server.yml /opt/app/docker-compose-server.yml.bak; fi",
                 "if [ -f /opt/app/deploy.sh ]; then cp -a /opt/app/deploy.sh /opt/app/deploy.sh.bak; fi",
+                "if [ -f /opt/app/backup-db.sh ]; then cp -a /opt/app/backup-db.sh /opt/app/backup-db.sh.bak; fi",
 
                 "mv /opt/app/docker-compose-server.yml.new /opt/app/docker-compose-server.yml",
                 "mv /opt/app/deploy.sh.new /opt/app/deploy.sh",
+                "mv /opt/app/backup-db.sh.new /opt/app/backup-db.sh",
+
+                "stat -c \"%A %U:%G %n\" /opt/app/backup-db.sh",
 
                 ("sudo -u ec2-user /opt/app/deploy.sh " + ($service | @sh)),
 
