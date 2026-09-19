@@ -948,7 +948,9 @@ export class GamesService {
           );
         }
 
-        await this.finishGame(manager, game, now);
+        // 이탈로 인한 조기 종료는 재게임 대상이 아니다 — 남은 인원이 방치되지 않도록
+        // 기존 #19 정책 그대로 Room을 FINISHED 처리한다.
+        await this.finishGame(manager, game, now, { allowReplay: false });
 
         return {
           finished: true as const,
@@ -1006,16 +1008,25 @@ export class GamesService {
 
   // 게임을 종료 처리한다: 정상 완료든, 이탈로 인한 조기 종료든 동일하게 재사용된다.
   // 아직 시작되지 않은(WAITING) 턴이 남아있다면(이탈/조기 종료로 더는 진행되지 않으므로) 함께 정리한다.
+  //
+  // Room의 이후 상태는 종료 사유에 따라 갈린다 (재게임 정책 — Game 종료 ≠ Room 종료):
+  // - 정상 완료(allowReplay: true, 기본값): Room은 삭제·종료되지 않고 WAITING으로 되돌아가
+  //   같은 방에서 새 게임을 시작할 수 있다. 참여자는 다시 준비해야 하므로 준비 상태를 초기화한다.
+  // - 이탈로 인한 조기 종료(allowReplay: false): 기존 #19 정책 그대로 Room을 FINISHED 처리한다
+  //   (남은 인원을 방치하지 않기 위함 — 이 경우는 재게임 대상이 아니다).
   private async finishGame(
     manager: EntityManager,
     game: GameSession,
     now: Date,
+    { allowReplay }: { allowReplay: boolean } = { allowReplay: true },
   ): Promise<void> {
     const gameRepository = manager.getRepository(GameSession);
 
     const turnRepository = manager.getRepository(GameTurn);
 
     const roomRepository = manager.getRepository(Room);
+
+    const memberRepository = manager.getRepository(RoomMember);
 
     game.status = GameStatus.FINISHED;
     game.finishedAt = now;
@@ -1030,9 +1041,20 @@ export class GamesService {
       { status: GameTurnStatus.EXPIRED },
     );
 
-    await roomRepository.update(game.roomId, {
-      status: RoomStatus.FINISHED,
-    });
+    if (allowReplay) {
+      await roomRepository.update(game.roomId, {
+        status: RoomStatus.WAITING,
+      });
+
+      await memberRepository.update(
+        { roomId: game.roomId, leftAt: IsNull() },
+        { isReady: false },
+      );
+    } else {
+      await roomRepository.update(game.roomId, {
+        status: RoomStatus.FINISHED,
+      });
+    }
   }
 
   // 현재 턴 종료(제출/만료/이탈로 인한 스킵) 후 게임을 마치거나 다음 턴을 시작한다.
@@ -1060,6 +1082,7 @@ export class GamesService {
 
     // 남은 활성 참여자의 WAITING 턴이 더 없음 (모든 턴 완료, 또는 나머지가 전부 이탈로 스킵됨)
     if (!nextTurn) {
+      // 정상 완료 — 재게임 정책에 따라 Room은 WAITING으로 되돌아간다 (기본값 allowReplay: true).
       await this.finishGame(manager, game, now);
 
       return {
