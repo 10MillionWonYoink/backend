@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { CreateRoomDto } from './dto/create-room.dto';
@@ -15,6 +16,8 @@ import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class RoomsService {
+  private readonly logger = new Logger(RoomsService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly configService: ConfigService,
@@ -154,6 +157,15 @@ export class RoomsService {
       .getOne();
 
     if (!room) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'room_access_failed',
+          reason: 'not_active_room_member',
+          roomId,
+          userId,
+        }),
+      );
+
       throw new ForbiddenException('참여 중인 대기실이 아닙니다.');
     }
 
@@ -209,10 +221,29 @@ export class RoomsService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_leave_failed',
+            reason: 'room_not_found',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
 
       if (room.status !== RoomStatus.WAITING) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_leave_failed',
+            reason: 'room_not_waiting',
+            roomId,
+            userId,
+            roomStatus: room.status,
+          }),
+        );
+
         throw new ConflictException('대기 중인 방에서만 나갈 수 있습니다.');
       }
 
@@ -228,6 +259,15 @@ export class RoomsService {
       });
 
       if (!leavingMember) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_leave_failed',
+            reason: 'active_member_not_found',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new BadRequestException('현재 방에 참여 중인 사용자가 아닙니다.');
       }
 
@@ -312,14 +352,43 @@ export class RoomsService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_update_failed',
+            reason: 'room_not_found',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
 
       if (room.hostId !== userId) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_update_failed',
+            reason: 'not_room_host',
+            roomId,
+            userId,
+            hostId: room.hostId,
+          }),
+        );
+
         throw new ForbiddenException('방장만 방 설정을 변경할 수 있습니다.');
       }
 
       if (room.status !== RoomStatus.WAITING) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_update_failed',
+            reason: 'room_not_waiting',
+            roomId,
+            userId,
+            roomStatus: room.status,
+          }),
+        );
+
         throw new ConflictException('대기 중인 방만 변경할 수 있습니다.');
       }
 
@@ -337,12 +406,34 @@ export class RoomsService {
         updateRoomDto.maxParticipants ?? room.maxParticipants;
 
       if (minParticipants > maxParticipants) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_update_failed',
+            reason: 'minimum_exceeds_maximum',
+            roomId,
+            userId,
+            minParticipants,
+            maxParticipants,
+          }),
+        );
+
         throw new BadRequestException(
           '최소 인원은 최대 인원보다 클 수 없습니다.',
         );
       }
 
       if (maxParticipants < activeMemberCount) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_update_failed',
+            reason: 'maximum_below_active_member_count',
+            roomId,
+            userId,
+            maxParticipants,
+            activeMemberCount,
+          }),
+        );
+
         throw new BadRequestException(
           '최대 인원을 현재 참여자 수보다 작게 설정할 수 없습니다.',
         );
@@ -391,20 +482,62 @@ export class RoomsService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_host_change_failed',
+            reason: 'room_not_found',
+            roomId,
+            currentUserId,
+            newHostUserId,
+          }),
+        );
+
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
 
       if (room.status !== RoomStatus.WAITING) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_host_change_failed',
+            reason: 'room_not_waiting',
+            roomId,
+            currentUserId,
+            newHostUserId,
+            roomStatus: room.status,
+          }),
+        );
+
         throw new ConflictException(
           '대기 중인 방만 방장을 변경할 수 있습니다.',
         );
       }
 
       if (room.hostId !== currentUserId) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_host_change_failed',
+            reason: 'not_current_host',
+            roomId,
+            currentUserId,
+            newHostUserId,
+            hostId: room.hostId,
+          }),
+        );
+
         throw new ForbiddenException('현재 방장만 방장을 변경할 수 있습니다.');
       }
 
       if (currentUserId === newHostUserId) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_host_change_failed',
+            reason: 'same_host_selected',
+            roomId,
+            currentUserId,
+            newHostUserId,
+          }),
+        );
+
         throw new BadRequestException('이미 현재 방장인 사용자입니다.');
       }
 
@@ -420,6 +553,16 @@ export class RoomsService {
       });
 
       if (!newHostMember) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_host_change_failed',
+            reason: 'new_host_not_active_member',
+            roomId,
+            currentUserId,
+            newHostUserId,
+          }),
+        );
+
         throw new BadRequestException(
           '새 방장은 현재 방에 참여 중인 사용자여야 합니다.',
         );
@@ -456,10 +599,29 @@ export class RoomsService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_join_failed',
+            reason: 'room_not_found',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
 
       if (room.status !== RoomStatus.WAITING) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_join_failed',
+            reason: 'room_not_waiting',
+            roomId,
+            userId,
+            roomStatus: room.status,
+          }),
+        );
+
         throw new ConflictException('대기 중인 방에만 참여할 수 있습니다.');
       }
 
@@ -476,6 +638,15 @@ export class RoomsService {
       });
 
       if (existingMember && existingMember.leftAt === null) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_join_failed',
+            reason: 'already_active_member',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new ConflictException('이미 참여 중인 방입니다.');
       }
 
@@ -487,6 +658,17 @@ export class RoomsService {
       });
 
       if (activeMemberCount >= room.maxParticipants) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_join_failed',
+            reason: 'room_capacity_exceeded',
+            roomId,
+            userId,
+            activeMemberCount,
+            maxParticipants: room.maxParticipants,
+          }),
+        );
+
         throw new ConflictException('방의 최대 인원을 초과했습니다.');
       }
 
@@ -532,10 +714,29 @@ export class RoomsService {
     });
 
     if (!room) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'room_invite_link_creation_failed',
+          reason: 'room_not_found',
+          roomId,
+          userId,
+        }),
+      );
+
       throw new NotFoundException('방을 찾을 수 없습니다.');
     }
 
     if (room.status !== RoomStatus.WAITING) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'room_invite_link_creation_failed',
+          reason: 'room_not_waiting',
+          roomId,
+          userId,
+          roomStatus: room.status,
+        }),
+      );
+
       throw new ConflictException('대기 중인 방만 초대할 수 있습니다.');
     }
 
@@ -548,6 +749,15 @@ export class RoomsService {
     });
 
     if (!member) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'room_invite_link_creation_failed',
+          reason: 'not_active_room_member',
+          roomId,
+          userId,
+        }),
+      );
+
       throw new ForbiddenException(
         '방에 참여 중인 사용자만 초대할 수 있습니다.',
       );
@@ -586,10 +796,28 @@ export class RoomsService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_invite_join_failed',
+            reason: 'invalid_invite_code',
+            userId,
+          }),
+        );
+
         throw new NotFoundException('유효하지 않은 초대 코드입니다.');
       }
 
       if (room.status !== RoomStatus.WAITING) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_invite_join_failed',
+            reason: 'room_not_waiting',
+            roomId: room.id,
+            userId,
+            roomStatus: room.status,
+          }),
+        );
+
         throw new ConflictException('이미 시작되었거나 종료된 방입니다.');
       }
 
@@ -601,6 +829,15 @@ export class RoomsService {
       });
 
       if (existingMember && existingMember.leftAt === null) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_invite_join_failed',
+            reason: 'already_active_member',
+            roomId: room.id,
+            userId,
+          }),
+        );
+
         throw new ConflictException('이미 참여 중인 방입니다.');
       }
 
@@ -612,6 +849,17 @@ export class RoomsService {
       });
 
       if (memberCount >= room.maxParticipants) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'room_invite_join_failed',
+            reason: 'room_capacity_exceeded',
+            roomId: room.id,
+            userId,
+            activeMemberCount: memberCount,
+            maxParticipants: room.maxParticipants,
+          }),
+        );
+
         throw new ConflictException('방의 최대 인원을 초과했습니다.');
       }
 
@@ -664,6 +912,16 @@ export class RoomsService {
     );
 
     if (result.affected === 0) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'room_ready_update_failed',
+          reason: 'active_member_not_found',
+          roomId,
+          userId,
+          requestedReadyState: isReady,
+        }),
+      );
+
       throw new NotFoundException('현재 참여 중인 사용자가 아닙니다.');
     }
 
@@ -707,6 +965,15 @@ export class RoomsService {
     });
 
     if (!member) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'active_room_member_lookup_failed',
+          reason: 'active_member_not_found',
+          roomId,
+          userId,
+        }),
+      );
+
       throw new ForbiddenException('현재 방에 참여 중인 사용자가 아닙니다.');
     }
 

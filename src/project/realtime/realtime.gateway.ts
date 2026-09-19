@@ -693,6 +693,16 @@ export class RealtimeGateway implements OnGatewayDisconnect {
 
   private validateChannel(client: RealtimeSocket, channel: string): void {
     if (!client.rooms.has(channel)) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'realtime_channel_validation_failed',
+          reason: 'socket_not_joined_to_channel',
+          socketId: client.id,
+          userId: client.data.userId ?? null,
+          channel,
+        }),
+      );
+
       throw new WsException('해당 실시간 채널에 참여하고 있지 않습니다.');
     }
   }
@@ -701,6 +711,14 @@ export class RealtimeGateway implements OnGatewayDisconnect {
     const userId = client.data.userId;
 
     if (!userId) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'realtime_user_validation_failed',
+          reason: 'authenticated_user_missing',
+          socketId: client.id,
+        }),
+      );
+
       throw new WsException('인증이 필요합니다.');
     }
 

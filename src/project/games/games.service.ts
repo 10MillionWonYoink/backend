@@ -78,14 +78,43 @@ export class GamesService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'game_start_failed',
+            reason: 'room_not_found',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
 
       if (room.hostId !== userId) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'game_start_failed',
+            reason: 'not_room_host',
+            roomId,
+            userId,
+            hostId: room.hostId,
+          }),
+        );
+
         throw new ForbiddenException('방장만 게임을 시작할 수 있습니다.');
       }
 
       if (room.status !== RoomStatus.WAITING) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'game_start_failed',
+            reason: 'room_not_waiting',
+            roomId,
+            userId,
+            roomStatus: room.status,
+          }),
+        );
+
         throw new ConflictException('대기 중인 방만 시작할 수 있습니다.');
       }
 
@@ -100,6 +129,17 @@ export class GamesService {
       });
 
       if (members.length < room.minParticipants) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'game_start_failed',
+            reason: 'insufficient_participants',
+            roomId,
+            userId,
+            memberCount: members.length,
+            minParticipants: room.minParticipants,
+          }),
+        );
+
         throw new ConflictException(
           `최소 ${room.minParticipants}명이 필요합니다.`,
         );
@@ -111,6 +151,15 @@ export class GamesService {
         .every((member) => member.isReady);
 
       if (!everyoneReady) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'game_start_failed',
+            reason: 'participants_not_ready',
+            roomId,
+            userId,
+          }),
+        );
+
         throw new ConflictException('아직 준비하지 않은 참여자가 있습니다.');
       }
 
@@ -222,6 +271,14 @@ export class GamesService {
       });
 
       if (!game) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'first_turn_start_failed',
+            reason: 'game_not_found',
+            gameId,
+          }),
+        );
+
         throw new NotFoundException('게임을 찾을 수 없습니다.');
       }
 
@@ -243,6 +300,14 @@ export class GamesService {
       });
 
       if (!firstTurn) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'first_turn_start_failed',
+            reason: 'waiting_turn_not_found',
+            gameId,
+          }),
+        );
+
         throw new NotFoundException('첫 번째 턴을 찾을 수 없습니다.');
       }
 
@@ -295,6 +360,15 @@ export class GamesService {
       });
 
     if (!uploadGame) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'game_turn_submission_failed',
+          reason: 'game_not_found',
+          gameId,
+          userId,
+        }),
+      );
+
       throw new NotFoundException('게임을 찾을 수 없습니다.');
     }
 
@@ -325,10 +399,29 @@ export class GamesService {
         });
 
         if (!game) {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'game_turn_submission_failed',
+              reason: 'game_not_found',
+              gameId,
+              userId,
+            }),
+          );
+
           throw new NotFoundException('게임을 찾을 수 없습니다.');
         }
 
         if (game.status !== GameStatus.IN_PROGRESS) {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'game_turn_submission_failed',
+              reason: 'game_not_in_progress',
+              gameId,
+              userId,
+              gameStatus: game.status,
+            }),
+          );
+
           throw new ConflictException('진행 중인 게임이 아닙니다.');
         }
 
@@ -338,10 +431,31 @@ export class GamesService {
         });
 
         if (!currentTurn) {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'game_turn_submission_failed',
+              reason: 'current_turn_not_found',
+              gameId,
+              userId,
+              turnNumber: game.currentTurnNumber,
+            }),
+          );
+
           throw new NotFoundException('현재 턴을 찾을 수 없습니다.');
         }
 
         if (currentTurn.userId !== userId) {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'game_turn_submission_failed',
+              reason: 'not_current_turn_user',
+              gameId,
+              userId,
+              currentTurnUserId: currentTurn.userId,
+              turnNumber: currentTurn.turnNumber,
+            }),
+          );
+
           throw new ForbiddenException(
             '현재 차례인 사용자만 제출할 수 있습니다.',
           );
@@ -350,6 +464,17 @@ export class GamesService {
         const now = new Date();
 
         if (currentTurn.expiresAt && currentTurn.expiresAt < now) {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'game_turn_submission_failed',
+              reason: 'submission_expired',
+              gameId,
+              userId,
+              turnNumber: currentTurn.turnNumber,
+              expiresAt: currentTurn.expiresAt.toISOString(),
+            }),
+          );
+
           throw new ConflictException('사진 제출 시간이 만료되었습니다.');
         }
 
@@ -397,9 +522,14 @@ export class GamesService {
   private evaluateGameInBackground(gameId: number): void {
     void this.runGameEvaluation(gameId).catch((error) => {
       this.logger.warn(
-        `게임(${gameId}) AI 평가 배치 처리 중 예기치 못한 오류: ${
-          error instanceof Error ? error.message : '알 수 없는 오류'
-        }`,
+        JSON.stringify({
+          event: 'game_evaluation_failed',
+          reason: 'unexpected_background_error',
+          gameId,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage:
+            error instanceof Error ? error.message : '알 수 없는 오류',
+        }),
       );
     });
   }
@@ -484,9 +614,15 @@ export class GamesService {
       evaluations = await this.geminiService.evaluatePhotosBatch(items);
     } catch (error) {
       this.logger.warn(
-        `사진 평가 배치(${chunk.length}건) 실패: ${
-          error instanceof Error ? error.message : '알 수 없는 오류'
-        }`,
+        JSON.stringify({
+          event: 'photo_evaluation_batch_failed',
+          reason: 'gemini_evaluation_failed',
+          batchSize: chunk.length,
+          turnIds: chunk.map((turn) => turn.id),
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage:
+            error instanceof Error ? error.message : '알 수 없는 오류',
+        }),
       );
 
       await turnRepository.update(
@@ -547,6 +683,14 @@ export class GamesService {
     const room = await roomRepository.findOneBy({ id: roomId });
 
     if (!room) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'game_turn_estimation_failed',
+          reason: 'room_not_found',
+          roomId,
+        }),
+      );
+
       throw new NotFoundException('방을 찾을 수 없습니다.');
     }
 
@@ -570,9 +714,14 @@ export class GamesService {
       return topics;
     } catch (error) {
       this.logger.warn(
-        `게임 Topic 배치 생성 실패: ${
-          error instanceof Error ? error.message : '알 수 없는 오류'
-        }`,
+        JSON.stringify({
+          event: 'game_topic_generation_failed',
+          reason: 'gemini_topic_generation_failed',
+          requestedCount: count,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage:
+            error instanceof Error ? error.message : '알 수 없는 오류',
+        }),
       );
 
       return [];
@@ -596,6 +745,14 @@ export class GamesService {
       });
 
       if (!game) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'game_turn_expiration_failed',
+            reason: 'game_not_found',
+            gameId,
+          }),
+        );
+
         throw new NotFoundException('게임을 찾을 수 없습니다.');
       }
 
@@ -674,6 +831,15 @@ export class GamesService {
       });
 
       if (!game) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'active_game_leave_failed',
+            reason: 'game_not_found',
+            gameId,
+            userId,
+          }),
+        );
+
         throw new NotFoundException('게임을 찾을 수 없습니다.');
       }
 
@@ -681,6 +847,16 @@ export class GamesService {
         game.status !== GameStatus.COUNTDOWN &&
         game.status !== GameStatus.IN_PROGRESS
       ) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'active_game_leave_failed',
+            reason: 'game_already_finished',
+            gameId,
+            userId,
+            gameStatus: game.status,
+          }),
+        );
+
         throw new ConflictException('이미 종료된 게임입니다.');
       }
 
@@ -694,6 +870,16 @@ export class GamesService {
       });
 
       if (!room) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'active_game_leave_failed',
+            reason: 'room_not_found',
+            gameId,
+            roomId: game.roomId,
+            userId,
+          }),
+        );
+
         throw new NotFoundException('방을 찾을 수 없습니다.');
       }
 
@@ -709,6 +895,16 @@ export class GamesService {
       });
 
       if (!leavingMember) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'active_game_leave_failed',
+            reason: 'active_member_not_found',
+            gameId,
+            roomId: game.roomId,
+            userId,
+          }),
+        );
+
         throw new BadRequestException('현재 방에 참여 중인 사용자가 아닙니다.');
       }
 
@@ -972,6 +1168,15 @@ export class GamesService {
     });
 
     if (!game) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'latest_game_lookup_failed',
+          reason: 'game_not_found',
+          roomId,
+          userId,
+        }),
+      );
+
       throw new NotFoundException('진행된 게임을 찾을 수 없습니다.');
     }
 
@@ -1054,6 +1259,16 @@ export class GamesService {
       game.status === GameStatus.COUNTDOWN ||
       game.status === GameStatus.IN_PROGRESS
     ) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'game_result_lookup_failed',
+          reason: 'game_not_finished',
+          gameId,
+          userId,
+          gameStatus: game.status,
+        }),
+      );
+
       throw new ConflictException('아직 종료되지 않은 게임입니다.');
     }
 
@@ -1197,6 +1412,14 @@ export class GamesService {
     const game = await gameRepository.findOneBy({ id: gameId });
 
     if (!game) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'game_lookup_failed',
+          reason: 'game_not_found',
+          gameId,
+        }),
+      );
+
       throw new NotFoundException('게임을 찾을 수 없습니다.');
     }
 
@@ -1217,6 +1440,15 @@ export class GamesService {
     });
 
     if (!member) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'game_access_failed',
+          reason: 'room_member_not_found',
+          roomId,
+          userId,
+        }),
+      );
+
       throw new ForbiddenException('해당 게임에 접근할 권한이 없습니다.');
     }
   }

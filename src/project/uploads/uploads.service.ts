@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   GetObjectCommand,
@@ -23,6 +23,7 @@ export class UploadsService {
   private readonly s3Client: S3Client;
   private readonly bucketName: string;
   private readonly keyPrefix: string;
+  private readonly logger = new Logger(UploadsService.name);
 
   constructor(private readonly configService: ConfigService) {
     const region = this.configService.getOrThrow<string>('AWS_REGION');
@@ -61,15 +62,18 @@ export class UploadsService {
   }) {
     const expectedPrefix = this.createUserDirectory(roomId, userId);
 
-    console.log({
-      roomId,
-      userId,
-      objectKey: JSON.stringify(objectKey),
-      expectedPrefix: JSON.stringify(expectedPrefix),
-      matched: objectKey.startsWith(expectedPrefix),
-    });
-
     if (!objectKey.startsWith(expectedPrefix)) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'uploaded_image_verification_failed',
+          reason: 'invalid_object_key_prefix',
+          roomId,
+          userId,
+          objectKey,
+          expectedPrefix,
+        }),
+      );
+
       throw new BadRequestException('올바르지 않은 이미지 경로입니다.');
     }
 
@@ -82,34 +86,83 @@ export class UploadsService {
           Key: objectKey,
         }),
       );
-    } catch {
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'uploaded_image_verification_failed',
+          reason: 's3_head_object_failed',
+          roomId,
+          userId,
+          objectKey,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        }),
+      );
+
       throw new BadRequestException('S3에 업로드된 이미지를 찾을 수 없습니다.');
     }
 
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
 
     if (!metadata.ContentType || !allowedTypes.includes(metadata.ContentType)) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'uploaded_image_verification_failed',
+          reason: 'unsupported_content_type',
+          roomId,
+          userId,
+          objectKey,
+          contentType: metadata.ContentType ?? null,
+        }),
+      );
+
       throw new BadRequestException('지원하지 않는 이미지 형식입니다.');
     }
 
     const maxSize = 10 * 1024 * 1024;
 
     if (!metadata.ContentLength || metadata.ContentLength > maxSize) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'uploaded_image_verification_failed',
+          reason: 'invalid_content_length',
+          roomId,
+          userId,
+          objectKey,
+          contentLength: metadata.ContentLength ?? null,
+          maxSize,
+        }),
+      );
+
       throw new BadRequestException('이미지 용량은 10MB 이하여야 합니다.');
     }
   }
 
   async createImageReadUrl(objectKey: string) {
-    return getSignedUrl(
-      this.s3Client,
-      new GetObjectCommand({
-        Bucket: this.bucketName,
-        Key: objectKey,
-      }),
-      {
-        expiresIn: 60 * 10,
-      },
-    );
+    try {
+      return await getSignedUrl(
+        this.s3Client,
+        new GetObjectCommand({
+          Bucket: this.bucketName,
+          Key: objectKey,
+        }),
+        {
+          expiresIn: 60 * 10,
+        },
+      );
+    } catch (error) {
+      this.logger.error(
+        JSON.stringify({
+          event: 'image_read_url_creation_failed',
+          objectKey,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        }),
+        error instanceof Error ? error.stack : undefined,
+      );
+
+      throw error;
+    }
   }
 
   async createUploadUrl({
@@ -121,21 +174,54 @@ export class UploadsService {
     const maxSize = 10 * 1024 * 1024;
 
     if (!Number.isInteger(fileSize) || fileSize < 1) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'upload_url_creation_failed',
+          reason: 'invalid_file_size',
+          roomId,
+          userId,
+          contentType,
+          fileSize,
+        }),
+      );
+
       throw new BadRequestException('올바르지 않은 파일 크기입니다.');
     }
 
     if (fileSize > maxSize) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'upload_url_creation_failed',
+          reason: 'file_size_exceeded',
+          roomId,
+          userId,
+          contentType,
+          fileSize,
+          maxSize,
+        }),
+      );
+
       throw new BadRequestException('이미지 용량은 10MB 이하여야 합니다.');
     }
 
     const extension = IMAGE_EXTENSION_BY_TYPE[contentType];
 
     if (!extension) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'upload_url_creation_failed',
+          reason: 'unsupported_content_type',
+          roomId,
+          userId,
+          contentType,
+          fileSize,
+        }),
+      );
+
       throw new BadRequestException('지원하지 않는 이미지 형식입니다.');
     }
 
     const directory = this.createUserDirectory(roomId, userId);
-
     const objectKey = `${directory}${randomUUID()}.${extension}`;
 
     const command = new PutObjectCommand({
@@ -144,14 +230,33 @@ export class UploadsService {
       ContentType: contentType,
     });
 
-    const uploadUrl = await getSignedUrl(this.s3Client, command, {
-      expiresIn: 60,
-    });
+    try {
+      const uploadUrl = await getSignedUrl(this.s3Client, command, {
+        expiresIn: 60,
+      });
 
-    return {
-      objectKey,
-      uploadUrl,
-      expiresIn: 60,
-    };
+      return {
+        objectKey,
+        uploadUrl,
+        expiresIn: 60,
+      };
+    } catch (error) {
+      this.logger.error(
+        JSON.stringify({
+          event: 'upload_url_creation_failed',
+          reason: 'presigned_url_creation_failed',
+          roomId,
+          userId,
+          objectKey,
+          contentType,
+          fileSize,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        }),
+        error instanceof Error ? error.stack : undefined,
+      );
+
+      throw error;
+    }
   }
 }
