@@ -59,36 +59,43 @@ jobs:
           SERVICE="backend"
           COMPOSE_SOURCE="docker-compose-server.yml"
           DEPLOY_SOURCE="deploy.sh"
+          NGINX_SOURCE="nginx/default.conf"
 
-          if [ ! -s "${COMPOSE_SOURCE}" ]; then
-            echo "${COMPOSE_SOURCE} 파일을 찾을 수 없거나 비어 있습니다."
-            exit 1
-          fi
+          for FILE in \
+            "${COMPOSE_SOURCE}" \
+            "${DEPLOY_SOURCE}" \
+            "${NGINX_SOURCE}"; do
 
-          if [ ! -s "${DEPLOY_SOURCE}" ]; then
-            echo "${DEPLOY_SOURCE} 파일을 찾을 수 없거나 비어 있습니다."
-            exit 1
-          fi
+            if [ ! -s "${FILE}" ]; then
+              echo "${FILE} 파일을 찾을 수 없거나 비어 있습니다."
+              exit 1
+            fi
+          done
 
           COMPOSE_B64="$(base64 -w 0 "${COMPOSE_SOURCE}")"
           DEPLOY_B64="$(base64 -w 0 "${DEPLOY_SOURCE}")"
+          NGINX_B64="$(base64 -w 0 "${NGINX_SOURCE}")"
 
           PARAMETERS="$(jq -nc \
             --arg compose "${COMPOSE_B64}" \
             --arg deploy "${DEPLOY_B64}" \
+            --arg nginx "${NGINX_B64}" \
             --arg service "${SERVICE}" \
             '{
               commands: [
                 "set -euo pipefail",
-                "trap \"rm -f /tmp/docker-compose-server.yml /tmp/deploy.sh\" EXIT",
 
-                ("printf '\''%s'\'' " + $compose + " | base64 -d > /tmp/docker-compose-server.yml"),
-                ("printf '\''%s'\'' " + $deploy + " | base64 -d > /tmp/deploy.sh"),
+                "trap \"rm -f /tmp/docker-compose-server.yml /tmp/deploy.sh /tmp/default.conf\" EXIT",
+
+                ("printf %s " + ($compose | @sh) + " | base64 -d > /tmp/docker-compose-server.yml"),
+                ("printf %s " + ($deploy | @sh) + " | base64 -d > /tmp/deploy.sh"),
+                ("printf %s " + ($nginx | @sh) + " | base64 -d > /tmp/default.conf"),
 
                 "bash -n /tmp/deploy.sh",
 
                 "install -o ec2-user -g ec2-user -m 0644 /tmp/docker-compose-server.yml /opt/app/docker-compose-server.yml.new",
                 "install -o ec2-user -g ec2-user -m 0755 /tmp/deploy.sh /opt/app/deploy.sh.new",
+                "install -o ec2-user -g ec2-user -m 0644 /tmp/default.conf /opt/app/nginx/default.conf.new",
 
                 "if [ -f /opt/app/.env ]; then sudo -u ec2-user docker compose --env-file /opt/app/.env -f /opt/app/docker-compose-server.yml.new config --quiet; fi",
 
@@ -98,7 +105,9 @@ jobs:
                 "mv /opt/app/docker-compose-server.yml.new /opt/app/docker-compose-server.yml",
                 "mv /opt/app/deploy.sh.new /opt/app/deploy.sh",
 
-                ("sudo -u ec2-user /opt/app/deploy.sh " + $service)
+                ("sudo -u ec2-user /opt/app/deploy.sh " + ($service | @sh)),
+
+                "if cmp -s /opt/app/nginx/default.conf.new /opt/app/nginx/default.conf; then echo \"Nginx 설정 변경 없음\"; rm -f /opt/app/nginx/default.conf.new; else cp -a /opt/app/nginx/default.conf /opt/app/nginx/default.conf.bak; cp /opt/app/nginx/default.conf.new /opt/app/nginx/default.conf; if ! docker exec app-nginx nginx -t; then cp /opt/app/nginx/default.conf.bak /opt/app/nginx/default.conf; docker exec app-nginx nginx -t || true; echo \"Nginx 설정 검증 실패: 기존 설정으로 복구했습니다.\"; exit 1; fi; if ! docker exec app-nginx nginx -s reload; then cp /opt/app/nginx/default.conf.bak /opt/app/nginx/default.conf; docker exec app-nginx nginx -t || true; docker exec app-nginx nginx -s reload || true; echo \"Nginx reload 실패: 기존 설정으로 복구했습니다.\"; exit 1; fi; rm -f /opt/app/nginx/default.conf.new; echo \"Nginx 설정 반영 완료\"; fi"
               ]
             }'
           )"
