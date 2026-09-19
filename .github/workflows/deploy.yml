@@ -60,7 +60,7 @@ jobs:
           COMPOSE_SOURCE="docker-compose-server.yml"
           DEPLOY_SOURCE="deploy.sh"
           NGINX_SOURCE="nginx/default.conf"
-          BACKUP_SOURCE="scripts/backup-db.sh"
+          BACKUP_SOURCE="backup-db.sh"
 
           for FILE in \
             "${COMPOSE_SOURCE}" \
