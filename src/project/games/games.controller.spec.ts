@@ -4,6 +4,7 @@ import {
   ExecutionContext,
   ConflictException,
   ForbiddenException,
+  ValidationPipe,
 } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
@@ -22,6 +23,7 @@ describe('GamesController', () => {
     findLatestGameByRoom: jest.fn(),
     getSessionState: jest.fn(),
     getResult: jest.fn(),
+    findMyGameHistory: jest.fn(),
   };
   const authGuard = { canActivate: jest.fn() };
 
@@ -44,6 +46,10 @@ describe('GamesController', () => {
 
     app = module.createNestApplication();
     app.setGlobalPrefix('api');
+    // main.ts와 동일한 전역 ValidationPipe (query DTO 검증을 실제로 검증하기 위함).
+    app.useGlobalPipes(
+      new ValidationPipe({ whitelist: true, transform: true }),
+    );
     await app.listen(0, '127.0.0.1');
   });
 
@@ -98,6 +104,61 @@ describe('GamesController', () => {
     );
 
     await request(app.getHttpServer()).get('/api/games/7').expect(403);
+  });
+
+  it('GET /api/games/my 는 내 게임 기록 목록을 조회한다 (gameId 동적 라우트보다 우선 매칭)', async () => {
+    const response = {
+      games: [
+        {
+          gameId: 7,
+          roomId: 12,
+          roomTitle: '테스트 방',
+          finishedAt: '2026-01-01T00:10:00.000Z',
+          participants: [
+            { userId: 3, nickname: '수연', profileImageUrl: null },
+          ],
+          myScore: 80,
+          myRank: 1,
+        },
+      ],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    };
+    gamesService.findMyGameHistory.mockResolvedValue(response);
+
+    await request(app.getHttpServer())
+      .get('/api/games/my')
+      .expect(200)
+      .expect(response);
+    expect(gamesService.findMyGameHistory).toHaveBeenCalledWith(3, {
+      limit: undefined,
+      offset: undefined,
+    });
+  });
+
+  it('GET /api/games/my 는 limit/offset 쿼리를 숫자로 변환해 전달한다', async () => {
+    gamesService.findMyGameHistory.mockResolvedValue({
+      games: [],
+      total: 0,
+      limit: 5,
+      offset: 10,
+    });
+
+    await request(app.getHttpServer())
+      .get('/api/games/my?limit=5&offset=10')
+      .expect(200);
+    expect(gamesService.findMyGameHistory).toHaveBeenCalledWith(3, {
+      limit: 5,
+      offset: 10,
+    });
+  });
+
+  it('GET /api/games/my 는 limit 범위를 벗어나면 400을 반환한다', async () => {
+    await request(app.getHttpServer())
+      .get('/api/games/my?limit=999')
+      .expect(400);
+    expect(gamesService.findMyGameHistory).not.toHaveBeenCalled();
   });
 
   it('숫자가 아닌 gameId는 400을 반환한다', async () => {

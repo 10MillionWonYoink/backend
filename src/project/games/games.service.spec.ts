@@ -1246,6 +1246,120 @@ describe('GamesService', () => {
     });
   });
 
+  describe('findMyGameHistory (내 게임 기록)', () => {
+    function createGameQueryBuilderMock(games: unknown[], total: number) {
+      return {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(games),
+        getCount: jest.fn().mockResolvedValue(total),
+      };
+    }
+
+    it('참여한 적 없는 사용자는 빈 목록을 반환한다', async () => {
+      const qb = createGameQueryBuilderMock([], 0);
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return { createQueryBuilder: () => qb };
+        }
+        throw new Error('unexpected');
+      });
+
+      await expect(service.findMyGameHistory(10)).resolves.toEqual({
+        games: [],
+        total: 0,
+        limit: 20,
+        offset: 0,
+      });
+    });
+
+    it('게임별 방 이름/참여자/내 평균 점수·순위를 계산해 반환한다 (기존 랭킹 로직 재사용)', async () => {
+      const finishedAt = new Date('2026-01-02T00:00:00Z');
+      const game = {
+        id: 5,
+        roomId: 1,
+        status: GameStatus.FINISHED,
+        finishedAt,
+      };
+      const qb = createGameQueryBuilderMock([game], 1);
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return { createQueryBuilder: () => qb };
+        }
+        if (entity === Room) {
+          return {
+            find: jest.fn().mockResolvedValue([{ id: 1, title: '테스트 방' }]),
+          };
+        }
+        if (entity === GameTurn) {
+          return {
+            find: jest.fn().mockResolvedValue([
+              {
+                gameSessionId: 5,
+                userId: 10,
+                user: { nickname: '나', profileImageUrl: null },
+                aiScore: 80,
+                aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+              },
+              {
+                gameSessionId: 5,
+                userId: 11,
+                user: { nickname: '친구', profileImageUrl: null },
+                aiScore: 60,
+                aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+              },
+            ]),
+          };
+        }
+        throw new Error('unexpected');
+      });
+
+      const result = await service.findMyGameHistory(10);
+
+      expect(result.games).toEqual([
+        {
+          gameId: 5,
+          roomId: 1,
+          roomTitle: '테스트 방',
+          finishedAt,
+          participants: [
+            { userId: 10, nickname: '나', profileImageUrl: null },
+            { userId: 11, nickname: '친구', profileImageUrl: null },
+          ],
+          myScore: 80,
+          myRank: 1,
+        },
+      ]);
+      expect(result.total).toBe(1);
+    });
+
+    it('limit/offset을 그대로 쿼리에 반영한다', async () => {
+      const qb = createGameQueryBuilderMock([], 0);
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return { createQueryBuilder: () => qb };
+        }
+        throw new Error('unexpected');
+      });
+
+      const result = await service.findMyGameHistory(10, {
+        limit: 5,
+        offset: 15,
+      });
+
+      expect(qb.skip).toHaveBeenCalledWith(15);
+      expect(qb.take).toHaveBeenCalledWith(5);
+      expect(result).toEqual({ games: [], total: 0, limit: 5, offset: 15 });
+    });
+  });
+
   describe('getSessionState / getResult / findLatestGameByRoom', () => {
     it('방 참여자가 아니면 세션 조회를 거부한다', async () => {
       dataSource.getRepository.mockImplementation((entity: unknown) => {
