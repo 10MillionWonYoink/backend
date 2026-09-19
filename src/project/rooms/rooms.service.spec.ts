@@ -15,6 +15,7 @@ describe('RoomsService', () => {
     andWhere: jest.fn(),
     orderBy: jest.fn(),
     addOrderBy: jest.fn(),
+    setLock: jest.fn(),
     getOne: jest.fn(),
     getMany: jest.fn(),
   };
@@ -23,8 +24,11 @@ describe('RoomsService', () => {
     findOneBy: jest.fn(),
     findOne: jest.fn(),
     find: jest.fn(),
+    save: jest.fn(),
+    remove: jest.fn(),
   };
   const memberRepository = {
+    createQueryBuilder: jest.fn(),
     find: jest.fn(),
     findOne: jest.fn(),
     count: jest.fn(),
@@ -51,10 +55,15 @@ describe('RoomsService', () => {
     queryBuilder.andWhere.mockReturnValue(queryBuilder);
     queryBuilder.orderBy.mockReturnValue(queryBuilder);
     queryBuilder.addOrderBy.mockReturnValue(queryBuilder);
+    queryBuilder.setLock.mockReturnValue(queryBuilder);
     roomRepository.createQueryBuilder.mockReturnValue(queryBuilder);
+    memberRepository.createQueryBuilder.mockReturnValue(queryBuilder);
     queryBuilder.getMany.mockResolvedValue([]);
     memberRepository.create.mockImplementation((input: unknown) => input);
     memberRepository.save.mockImplementation((input: unknown) =>
+      Promise.resolve(input),
+    );
+    roomRepository.save.mockImplementation((input: unknown) =>
       Promise.resolve(input),
     );
     dataSource.transaction.mockImplementation(
@@ -277,6 +286,83 @@ describe('RoomsService', () => {
     ]);
 
     await expect(service.findAll()).resolves.toEqual([]);
+  });
+
+  describe('leaveRoom', () => {
+    const waitingRoom = {
+      id: 21,
+      hostId: 100,
+      status: RoomStatus.WAITING,
+    };
+
+    it('마지막 참여자가 나가도 Room을 삭제하지 않고 FINISHED로 닫아서 게임 기록을 보존한다', async () => {
+      roomRepository.findOne.mockResolvedValue({ ...waitingRoom });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 21,
+        userId: 100,
+        leftAt: null,
+        isReady: true,
+        turnOrder: null,
+      });
+      // 이탈 후 남은 활성 참여자 없음
+      queryBuilder.getMany.mockResolvedValue([]);
+
+      const result = await service.leaveRoom(21, 100);
+
+      expect(roomRepository.remove).not.toHaveBeenCalled();
+      expect(roomRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: RoomStatus.FINISHED }),
+      );
+      expect(result).toEqual({
+        roomId: 21,
+        leftUserId: 100,
+        currentParticipants: 0,
+        roomDeleted: true,
+        hostChanged: false,
+        previousHostId: null,
+        newHostId: null,
+      });
+    });
+
+    it('남은 참여자가 있으면 방을 닫지 않고, 방장이었다면 가장 먼저 입장한 사람에게 방장을 넘긴다', async () => {
+      roomRepository.findOne.mockResolvedValue({ ...waitingRoom });
+      memberRepository.findOne.mockResolvedValue({
+        roomId: 21,
+        userId: 100,
+        leftAt: null,
+      });
+      queryBuilder.getMany.mockResolvedValue([
+        { userId: 101, joinedAt: new Date('2026-01-01T00:00:01Z') },
+      ]);
+
+      const result = await service.leaveRoom(21, 100);
+
+      expect(roomRepository.remove).not.toHaveBeenCalled();
+      // 방장 승계이므로 room.save는 호출되지만(hostId 갱신), status는 그대로 WAITING이어야 한다.
+      expect(roomRepository.save).toHaveBeenCalledWith(
+        expect.objectContaining({ status: RoomStatus.WAITING, hostId: 101 }),
+      );
+      expect(result).toEqual({
+        roomId: 21,
+        leftUserId: 100,
+        currentParticipants: 1,
+        roomDeleted: false,
+        hostChanged: true,
+        previousHostId: 100,
+        newHostId: 101,
+      });
+    });
+
+    it('WAITING 상태가 아니면 나갈 수 없다', async () => {
+      roomRepository.findOne.mockResolvedValue({
+        ...waitingRoom,
+        status: RoomStatus.IN_PROGRESS,
+      });
+
+      await expect(service.leaveRoom(21, 100)).rejects.toThrow(
+        ConflictException,
+      );
+    });
   });
 
   describe('joinRoom', () => {

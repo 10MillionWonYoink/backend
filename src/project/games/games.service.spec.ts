@@ -5,7 +5,7 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, IsNull } from 'typeorm';
 import { GamesService } from './games.service';
 import { Room, RoomStatus } from '../rooms/entities/room.entity';
 import { RoomMember } from '../rooms/entities/room-member.entity';
@@ -46,6 +46,7 @@ describe('GamesService', () => {
     findOne: jest.fn(),
     save: jest.fn(),
     count: jest.fn(),
+    update: jest.fn(),
   };
   const gameRepository = {
     findOne: jest.fn(),
@@ -157,6 +158,49 @@ describe('GamesService', () => {
       await expect(service.startGame(1, 999)).rejects.toThrow(
         ForbiddenException,
       );
+    });
+
+    it('재게임 중복 요청 방지: 이미 대기 중이 아닌 방(진행 중/카운트다운)에서는 다시 시작할 수 없다', async () => {
+      roomRepository.findOne.mockResolvedValue({
+        ...room,
+        status: RoomStatus.IN_PROGRESS,
+      });
+
+      await expect(service.startGame(1, 10)).rejects.toThrow(ConflictException);
+      // 방장이 재게임을 두 번 연달아 호출해도(예: 더블 클릭) 이미 COUNTDOWN/IN_PROGRESS로
+      // 바뀐 상태에서는 트랜잭션 내 pessimistic_write 락으로 직렬화된 두 번째 호출이
+      // 곧바로 여기서 막힌다 — 별도의 중복 방지 로직 없이 기존 상태 검증만으로 충분하다.
+      expect(gameRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('재게임: 정상 종료로 Room이 WAITING으로 되돌아온 뒤에는 같은 Room에서 새 게임을 시작할 수 있다', async () => {
+      // finishGame(allowReplay: true)이 Room을 WAITING으로 되돌린 뒤의 상태를 그대로 재현.
+      roomRepository.findOne.mockResolvedValue({
+        ...room,
+        status: RoomStatus.WAITING,
+      });
+      memberRepository.find.mockResolvedValue([
+        {
+          userId: 10,
+          isReady: false,
+          turnOrder: null,
+          joinedAt: new Date('2026-01-01T00:00:00Z'),
+        },
+        {
+          userId: 11,
+          isReady: true,
+          turnOrder: null,
+          joinedAt: new Date('2026-01-01T00:00:01Z'),
+        },
+      ]);
+
+      const result = await service.startGame(1, 10);
+
+      // 새 GameSession이 생성될 뿐, 이전 게임의 GameTurn/점수와는 무관한 새 turnNumber
+      // 시퀀스로 새로 만들어진다 (gameSessionId가 다른 별개의 행이므로 자연히 분리된다).
+      expect(result.status).toBe(GameStatus.COUNTDOWN);
+      expect(gameRepository.create).toHaveBeenCalled();
+      expect(result.turns.map((turn) => turn.userId)).toEqual([10, 11, 10, 11]);
     });
 
     it('준비하지 않은 참여자가 있으면 시작할 수 없다', async () => {
@@ -429,7 +473,7 @@ describe('GamesService', () => {
       expect(evaluateSpy).not.toHaveBeenCalled();
     });
 
-    it('마지막 턴 제출로 게임이 끝나면 방을 종료 상태로 만들고 배치 평가를 트리거한다', async () => {
+    it('마지막 턴 제출로 게임이 정상 종료되면 재게임을 위해 방을 WAITING으로 되돌리고, 참여자 준비 상태를 초기화하고, 배치 평가를 트리거한다', async () => {
       gameRepository.findOne.mockResolvedValue({
         ...game,
         currentTurnNumber: 2,
@@ -448,9 +492,15 @@ describe('GamesService', () => {
 
       expect(result.finished).toBe(true);
       expect(result.nextTurn).toBeNull();
+      // 재게임 정책: 정상 종료는 Room을 삭제/종료하지 않고 WAITING으로 되돌린다.
       expect(roomRepository.update).toHaveBeenCalledWith(1, {
-        status: RoomStatus.FINISHED,
+        status: RoomStatus.WAITING,
       });
+      // 다음 게임을 시작하려면 다시 준비해야 하므로 현재 참여자의 준비 상태를 초기화한다.
+      expect(memberRepository.update).toHaveBeenCalledWith(
+        { roomId: 1, leftAt: IsNull() },
+        { isReady: false },
+      );
       expect(evaluateSpy).toHaveBeenCalledWith(5);
     });
 
@@ -794,9 +844,12 @@ describe('GamesService', () => {
       expect(gameRepository.save).toHaveBeenCalledWith(
         expect.objectContaining({ status: GameStatus.FINISHED }),
       );
+      // 이탈로 인한 조기 종료는 재게임 대상이 아니다 (allowReplay: false) — 정상 종료와 달리
+      // Room은 FINISHED로 남고, 남은 참여자의 준비 상태도 초기화하지 않는다.
       expect(roomRepository.update).toHaveBeenCalledWith(1, {
         status: RoomStatus.FINISHED,
       });
+      expect(memberRepository.update).not.toHaveBeenCalled();
       expect(result).toEqual({
         finished: true,
         gameId: 5,
@@ -1190,6 +1243,120 @@ describe('GamesService', () => {
         [],
       );
       expect(geminiService.generateTopics).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('findMyGameHistory (내 게임 기록)', () => {
+    function createGameQueryBuilderMock(games: unknown[], total: number) {
+      return {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        take: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(games),
+        getCount: jest.fn().mockResolvedValue(total),
+      };
+    }
+
+    it('참여한 적 없는 사용자는 빈 목록을 반환한다', async () => {
+      const qb = createGameQueryBuilderMock([], 0);
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return { createQueryBuilder: () => qb };
+        }
+        throw new Error('unexpected');
+      });
+
+      await expect(service.findMyGameHistory(10)).resolves.toEqual({
+        games: [],
+        total: 0,
+        limit: 20,
+        offset: 0,
+      });
+    });
+
+    it('게임별 방 이름/참여자/내 평균 점수·순위를 계산해 반환한다 (기존 랭킹 로직 재사용)', async () => {
+      const finishedAt = new Date('2026-01-02T00:00:00Z');
+      const game = {
+        id: 5,
+        roomId: 1,
+        status: GameStatus.FINISHED,
+        finishedAt,
+      };
+      const qb = createGameQueryBuilderMock([game], 1);
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return { createQueryBuilder: () => qb };
+        }
+        if (entity === Room) {
+          return {
+            find: jest.fn().mockResolvedValue([{ id: 1, title: '테스트 방' }]),
+          };
+        }
+        if (entity === GameTurn) {
+          return {
+            find: jest.fn().mockResolvedValue([
+              {
+                gameSessionId: 5,
+                userId: 10,
+                user: { nickname: '나', profileImageUrl: null },
+                aiScore: 80,
+                aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+              },
+              {
+                gameSessionId: 5,
+                userId: 11,
+                user: { nickname: '친구', profileImageUrl: null },
+                aiScore: 60,
+                aiEvaluationStatus: GameTurnEvaluationStatus.COMPLETED,
+              },
+            ]),
+          };
+        }
+        throw new Error('unexpected');
+      });
+
+      const result = await service.findMyGameHistory(10);
+
+      expect(result.games).toEqual([
+        {
+          gameId: 5,
+          roomId: 1,
+          roomTitle: '테스트 방',
+          finishedAt,
+          participants: [
+            { userId: 10, nickname: '나', profileImageUrl: null },
+            { userId: 11, nickname: '친구', profileImageUrl: null },
+          ],
+          myScore: 80,
+          myRank: 1,
+        },
+      ]);
+      expect(result.total).toBe(1);
+    });
+
+    it('limit/offset을 그대로 쿼리에 반영한다', async () => {
+      const qb = createGameQueryBuilderMock([], 0);
+
+      dataSource.getRepository.mockImplementation((entity: unknown) => {
+        if (entity === GameSession) {
+          return { createQueryBuilder: () => qb };
+        }
+        throw new Error('unexpected');
+      });
+
+      const result = await service.findMyGameHistory(10, {
+        limit: 5,
+        offset: 15,
+      });
+
+      expect(qb.skip).toHaveBeenCalledWith(15);
+      expect(qb.take).toHaveBeenCalledWith(5);
+      expect(result).toEqual({ games: [], total: 0, limit: 5, offset: 15 });
     });
   });
 
