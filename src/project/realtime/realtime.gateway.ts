@@ -495,6 +495,12 @@ export class RealtimeGateway implements OnGatewayDisconnect {
   ): Promise<void> {
     try {
       await this.processGameLeave(gameId, userId);
+
+      // 연결 종료 유예 만료로 실제 이탈 처리된 경우를 명시적 game:leave와 구분해
+      // 추적할 수 있도록 남긴다 (원인 파악용).
+      this.logger.log(
+        `게임(${gameId}) 유저(${userId}) 연결 종료 유예 시간(${RealtimeGateway.DISCONNECT_GRACE_MS}ms) 만료로 이탈 처리됨.`,
+      );
     } catch (error) {
       // 유예 시간 사이 게임이 이미 다른 방식으로 종료되었거나, 이미 이탈 처리된 경우 등은
       // 정상적인 경쟁 상황이므로 에러를 밖으로 던지지 않고 로그만 남긴다.
