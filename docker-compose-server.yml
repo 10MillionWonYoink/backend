@@ -36,6 +36,7 @@ services:
         awslogs-region: "ap-northeast-2"
         awslogs-group: "/picyonik/prod/backend"
         awslogs-stream: "backend-ec2-1"
+        awslogs-create-group: "false"
 
     environment:
       NODE_ENV: ${NODE_ENV:-dev}

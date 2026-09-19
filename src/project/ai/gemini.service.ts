@@ -199,14 +199,31 @@ export class GeminiService {
       });
     } catch (error) {
       this.logger.warn(
-        `Gemini Topic 배치 생성 호출 실패: ${this.describe(error)}`,
+        JSON.stringify({
+          event: 'gemini_topic_generation_failed',
+          reason: 'api_request_failed',
+          model: this.model,
+          requestedCount: count,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage: this.describe(error),
+        }),
       );
+
       throw new GeminiApiError('Topic 생성 요청에 실패했습니다.');
     }
 
     const parsed = this.parseJson(response);
 
     if (!isTopicBatchPayload(parsed)) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gemini_topic_generation_failed',
+          reason: 'invalid_response_format',
+          model: this.model,
+          requestedCount: count,
+        }),
+      );
+
       throw new GeminiResponseFormatError(
         'Topic 응답 형식이 올바르지 않습니다.',
       );
@@ -222,15 +239,19 @@ export class GeminiService {
     );
 
     if (topics.length === 0) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gemini_topic_generation_failed',
+          reason: 'empty_topic_result',
+          model: this.model,
+          requestedCount: count,
+        }),
+      );
+
       throw new GeminiResponseFormatError(
         'Topic 응답 형식이 올바르지 않습니다.',
       );
     }
-
-    // 게임당 호출 횟수 추적용 (요청한 수량 대비 실제 생성된 수량을 함께 남긴다).
-    this.logger.log(
-      `Gemini Topic 배치 생성 호출 1회 완료 (요청 ${count}개 / 생성 ${topics.length}개)`,
-    );
 
     return { topics };
   }
@@ -280,14 +301,31 @@ export class GeminiService {
       });
     } catch (error) {
       this.logger.warn(
-        `Gemini 사진 평가 배치 호출 실패: ${this.describe(error)}`,
+        JSON.stringify({
+          event: 'gemini_photo_evaluation_failed',
+          reason: 'api_request_failed',
+          model: this.model,
+          requestedCount: items.length,
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage: this.describe(error),
+        }),
       );
+
       throw new GeminiApiError('사진 평가 요청에 실패했습니다.');
     }
 
     const parsed = this.parseJson(response);
 
     if (!isEvaluationBatchPayload(parsed)) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gemini_photo_evaluation_failed',
+          reason: 'invalid_response_format',
+          model: this.model,
+          requestedCount: items.length,
+        }),
+      );
+
       throw new GeminiResponseFormatError(
         '평가 응답 형식이 올바르지 않습니다.',
       );
@@ -298,15 +336,19 @@ export class GeminiService {
       .filter((entry): entry is PhotoEvaluationResultItem => entry !== null);
 
     if (results.length === 0) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gemini_photo_evaluation_failed',
+          reason: 'empty_evaluation_result',
+          model: this.model,
+          requestedCount: items.length,
+        }),
+      );
+
       throw new GeminiResponseFormatError(
         '평가 응답 형식이 올바르지 않습니다.',
       );
     }
-
-    // 게임당 호출 횟수 추적용 (청크 하나당 1회 호출됨을 확인하기 위함).
-    this.logger.log(
-      `Gemini 사진 평가 배치 호출 1회 완료 (요청 ${items.length}장 / 응답 ${results.length}건)`,
-    );
 
     return results;
   }
@@ -319,6 +361,14 @@ export class GeminiService {
     const apiKey = this.configService.get<string>('GEMINI_API_KEY');
 
     if (!apiKey) {
+      this.logger.error(
+        JSON.stringify({
+          event: 'gemini_client_initialization_failed',
+          reason: 'api_key_missing',
+          model: this.model,
+        }),
+      );
+
       throw new GeminiApiError('GEMINI_API_KEY가 설정되지 않았습니다.');
     }
 
@@ -341,12 +391,28 @@ export class GeminiService {
       });
     } catch (error) {
       // 이미지 URL(서명된 S3 URL 등)에는 민감한 토큰이 포함될 수 있으므로 로그에 남기지 않는다.
-      this.logger.warn(`평가용 이미지 다운로드 실패: ${this.describe(error)}`);
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gemini_image_download_failed',
+          reason: 'request_failed',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage: this.describe(error),
+        }),
+      );
+
       throw new GeminiApiError('이미지를 불러오지 못했습니다.');
     }
 
     if (!response.ok) {
-      this.logger.warn(`평가용 이미지 응답 실패 (status=${response.status})`);
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gemini_image_download_failed',
+          reason: 'invalid_http_response',
+          statusCode: response.status,
+          statusText: response.statusText,
+        }),
+      );
+
       throw new GeminiApiError('이미지를 불러오지 못했습니다.');
     }
 
