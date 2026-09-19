@@ -10,6 +10,7 @@ import { RoomsModule } from './project/rooms/rooms.module';
 import { GamesModule } from './project/games/games.module';
 import { RealtimeModule } from './project/realtime/realtime.module';
 import { UploadsModule } from './project/uploads/uploads.module';
+import { ChatModule } from './project/chat/chat.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { UploadsModule } from './project/uploads/uploads.module';
     GamesModule,
     RealtimeModule,
     UploadsModule,
+    ChatModule,
   ],
   controllers: [AppController],
   providers: [AppService],
