@@ -6,7 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, EntityManager, IsNull, MoreThan } from 'typeorm';
+import { DataSource, EntityManager, In, IsNull, MoreThan } from 'typeorm';
 import { Room, RoomStatus } from '../rooms/entities/room.entity';
 import { RoomMember } from '../rooms/entities/room-member.entity';
 import { GameSession, GameStatus } from './entities/game-session.entity';
@@ -1210,6 +1210,113 @@ export class GamesService {
       countdownEndsAt: game.countdownEndsAt,
       currentTurnNumber: game.currentTurnNumber,
       totalTurns: game.totalTurns,
+    };
+  }
+
+  // "내 게임 기록" 목록: 사용자가 과거에 참여해 종료(FINISHED)된 게임들을 최신순으로 조회한다.
+  // 상세 화면은 기존 getResult(gameId, userId)를 그대로 재사용한다 (여기선 목록 요약만 제공).
+  async findMyGameHistory(
+    userId: number,
+    { limit = 20, offset = 0 }: { limit?: number; offset?: number } = {},
+  ) {
+    const gameRepository = this.dataSource.getRepository(GameSession);
+
+    // 이탈 등으로 참여자 수가 줄어도 relayCount > 1이면 한 게임에 내 턴이 여러 개일 수 있으므로,
+    // JOIN 대신 EXISTS로 걸러 게임 단위 중복 없이 가져온다.
+    const [games, total] = await Promise.all([
+      gameRepository
+        .createQueryBuilder('game')
+        .where('game.status = :status', { status: GameStatus.FINISHED })
+        .andWhere(
+          `EXISTS (
+            SELECT 1 FROM game_turns turn
+            WHERE turn.game_session_id = game.id AND turn.user_id = :userId
+          )`,
+          { userId },
+        )
+        .orderBy('game.finishedAt', 'DESC')
+        .addOrderBy('game.id', 'DESC')
+        .skip(offset)
+        .take(limit)
+        .getMany(),
+      gameRepository
+        .createQueryBuilder('game')
+        .where('game.status = :status', { status: GameStatus.FINISHED })
+        .andWhere(
+          `EXISTS (
+            SELECT 1 FROM game_turns turn
+            WHERE turn.game_session_id = game.id AND turn.user_id = :userId
+          )`,
+          { userId },
+        )
+        .getCount(),
+    ]);
+
+    if (games.length === 0) {
+      return { games: [], total, limit, offset };
+    }
+
+    const gameIds = games.map((game) => game.id);
+    const roomRepository = this.dataSource.getRepository(Room);
+    const turnRepository = this.dataSource.getRepository(GameTurn);
+
+    const [rooms, turns] = await Promise.all([
+      roomRepository.find({
+        where: { id: In([...new Set(games.map((game) => game.roomId))]) },
+      }),
+      turnRepository.find({
+        where: { gameSessionId: In(gameIds) },
+        relations: { user: true },
+      }),
+    ]);
+
+    const roomTitleById = new Map(rooms.map((room) => [room.id, room.title]));
+
+    const turnsByGameId = new Map<number, GameTurn[]>();
+
+    for (const turn of turns) {
+      const list = turnsByGameId.get(turn.gameSessionId) ?? [];
+
+      list.push(turn);
+      turnsByGameId.set(turn.gameSessionId, list);
+    }
+
+    return {
+      games: games.map((game) => {
+        const gameTurns = turnsByGameId.get(game.id) ?? [];
+
+        // 기존 결과 화면(getResult)과 동일한 랭킹 로직을 재사용해 숫자가 어긋나지 않게 한다.
+        const ranking = this.buildRanking(gameTurns);
+        const myRanking = ranking.find((entry) => entry.userId === userId);
+
+        const participantsByUserId = new Map<
+          number,
+          { userId: number; nickname: string; profileImageUrl: string | null }
+        >();
+
+        for (const turn of gameTurns) {
+          if (!participantsByUserId.has(turn.userId)) {
+            participantsByUserId.set(turn.userId, {
+              userId: turn.userId,
+              nickname: turn.user.nickname ?? '익명',
+              profileImageUrl: turn.user.profileImageUrl,
+            });
+          }
+        }
+
+        return {
+          gameId: game.id,
+          roomId: game.roomId,
+          roomTitle: roomTitleById.get(game.roomId) ?? null,
+          finishedAt: game.finishedAt,
+          participants: Array.from(participantsByUserId.values()),
+          myScore: myRanking?.totalScore ?? 0,
+          myRank: myRanking?.rank ?? null,
+        };
+      }),
+      total,
+      limit,
+      offset,
     };
   }
 

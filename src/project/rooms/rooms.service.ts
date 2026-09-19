@@ -290,9 +290,18 @@ export class RoomsService {
         .setLock('pessimistic_write')
         .getMany();
 
-      // 남은 사람이 없으면 방 삭제
+      // 남은 사람이 없으면 방을 닫는다. 과거에는 Room row 자체를 삭제했지만,
+      // GameSession.room이 onDelete: CASCADE라서 그 방에서 쌓인 게임 기록(GameSession/
+      // GameTurn, 점수·결과 포함)까지 함께 삭제되는 문제가 있었다 — 재게임 정책으로 한 판
+      // 끝나면 방이 다시 WAITING으로 돌아가므로, "한 판 하고 다 같이 나가기"가 정확히 이
+      // 삭제 조건에 해당해 흔하게 발생한다. 그래서 실제 삭제 대신 FINISHED로 상태만
+      // 바꿔 보존한다 (FINISHED는 이미 "이 방에서 더 이상 게임을 진행하지 않는다"는
+      // 의미로 쓰이고 있다 — GamesService.finishGame의 이탈 조기종료 경로 참고).
+      // FE 관점에서는 기존과 동일하게 "방이 닫혔다"로 취급하면 된다(roomDeleted: true 유지).
       if (remainingMembers.length === 0) {
-        await roomRepository.remove(room);
+        room.status = RoomStatus.FINISHED;
+
+        await roomRepository.save(room);
 
         return {
           roomId,
