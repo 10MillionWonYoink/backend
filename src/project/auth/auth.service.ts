@@ -2,6 +2,7 @@ import {
   BadGatewayException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
@@ -22,6 +23,8 @@ import {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
@@ -62,6 +65,15 @@ export class AuthService {
 
     if (!response.ok) {
       const kakaoError = await response.text();
+
+      this.logger.error(
+        JSON.stringify({
+          event: 'kakao_profile_lookup_failed',
+          reason: 'kakao_api_error',
+          statusCode: response.status,
+          statusText: response.statusText,
+        }),
+      );
 
       throw new BadGatewayException({
         message: '카카오 사용자 조회에 실패했습니다.',
@@ -131,6 +143,14 @@ export class AuthService {
    */
   async setLoginCookies(response: Response, user: User): Promise<void> {
     if (!user.registrationCompleted) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'login_cookie_setting_failed',
+          reason: 'signup_not_completed',
+          userId: user.id,
+        }),
+      );
+
       throw new UnauthorizedException('회원가입이 완료되지 않은 사용자입니다.');
     }
     const accessPayload: AccessTokenPayload = {
@@ -208,6 +228,15 @@ export class AuthService {
     if (!response.ok) {
       const kakaoError = await response.text();
 
+      this.logger.error(
+        JSON.stringify({
+          event: 'kakao_token_exchange_failed',
+          reason: 'kakao_api_error',
+          statusCode: response.status,
+          statusText: response.statusText,
+        }),
+      );
+
       throw new BadGatewayException({
         message: '카카오 토큰 발급에 실패했습니다.',
         kakaoError,
@@ -232,13 +261,12 @@ export class AuthService {
       },
     );
 
-    const isProduction =
-      this.configService.get<string>('NODE_ENV') === 'production';
+    const isProduction = this.configService.get<string>('NODE_ENV') === 'dev';
 
     response.cookie('signup_token', signupToken, {
       httpOnly: true,
       secure: isProduction,
-      sameSite: 'lax',
+      sameSite: 'none',
       maxAge: 30 * 60 * 1000,
     });
   }
@@ -251,6 +279,13 @@ export class AuthService {
     signupDto: SignupDto,
   ): Promise<User> {
     if (!signupToken) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'signup_completion_failed',
+          reason: 'signup_token_missing',
+        }),
+      );
+
       throw new UnauthorizedException('카카오 로그인이 필요합니다.');
     }
 
@@ -263,11 +298,30 @@ export class AuthService {
           secret: this.configService.getOrThrow<string>('JWT_SIGNUP_SECRET'),
         },
       );
-    } catch {
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'signup_completion_failed',
+          reason: 'signup_token_verification_failed',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage:
+            error instanceof Error ? error.message : '알 수 없는 오류',
+        }),
+      );
+
       throw new UnauthorizedException('회원가입 인증이 만료되었습니다.');
     }
 
     if (payload.purpose !== 'signup') {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'signup_completion_failed',
+          reason: 'invalid_signup_token_purpose',
+          userId: payload.sub,
+          tokenPurpose: payload.purpose,
+        }),
+      );
+
       throw new UnauthorizedException('올바르지 않은 회원가입 토큰입니다.');
     }
 
@@ -276,10 +330,26 @@ export class AuthService {
     });
 
     if (!user) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'signup_completion_failed',
+          reason: 'pending_user_not_found',
+          userId: payload.sub,
+        }),
+      );
+
       throw new NotFoundException('가입 대기 사용자를 찾을 수 없습니다.');
     }
 
     if (user.registrationCompleted) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'signup_completion_failed',
+          reason: 'signup_already_completed',
+          userId: user.id,
+        }),
+      );
+
       throw new ConflictException('이미 가입된 회원입니다.');
     }
 
@@ -291,6 +361,13 @@ export class AuthService {
 
   async refreshLogin(refreshToken: string | undefined): Promise<User> {
     if (!refreshToken) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'login_refresh_failed',
+          reason: 'refresh_token_missing',
+        }),
+      );
+
       throw new UnauthorizedException('리프레시 토큰이 없습니다.');
     }
 
@@ -303,13 +380,32 @@ export class AuthService {
           secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
         },
       );
-    } catch {
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'login_refresh_failed',
+          reason: 'refresh_token_verification_failed',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          errorMessage:
+            error instanceof Error ? error.message : '알 수 없는 오류',
+        }),
+      );
+
       throw new UnauthorizedException(
         '리프레시 토큰이 만료되었거나 올바르지 않습니다.',
       );
     }
 
     if (payload.type !== 'refresh') {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'login_refresh_failed',
+          reason: 'invalid_refresh_token_type',
+          userId: payload.sub,
+          tokenType: payload.type,
+        }),
+      );
+
       throw new UnauthorizedException('올바르지 않은 리프레시 토큰입니다.');
     }
 
@@ -318,6 +414,16 @@ export class AuthService {
     });
 
     if (!user || !user.registrationCompleted) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'login_refresh_failed',
+          reason: 'user_not_eligible_for_login',
+          userId: payload.sub,
+          userFound: Boolean(user),
+          registrationCompleted: user?.registrationCompleted ?? false,
+        }),
+      );
+
       throw new UnauthorizedException('로그인할 수 없는 사용자입니다.');
     }
 

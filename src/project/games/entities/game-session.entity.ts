@@ -55,7 +55,7 @@ export class GameSession {
   })
   currentTurnNumber: number;
 
-  // 게임 시작 시 Room.relayCount를 복사
+  // 게임 시작 시 생성되는 전체 턴 수
   @Column({
     name: 'total_turns',
     type: 'int',
@@ -77,6 +77,16 @@ export class GameSession {
     nullable: true,
   })
   initialImageKey: string | null;
+
+  // 게임 시작 시 AI(Gemini)가 생성한 포토 릴레이 주제.
+  // 생성에 실패해도 게임 시작 자체를 막지 않으므로 null일 수 있다.
+  @Column({
+    name: 'topic',
+    type: 'varchar',
+    length: 500,
+    nullable: true,
+  })
+  topic: string | null;
 
   @Column({
     name: 'started_at',

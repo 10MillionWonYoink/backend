@@ -29,6 +29,9 @@
     "migration:show:prod": "typeorm migration:show -d ./dist/database/data-source.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1131.0",
+    "@aws-sdk/s3-request-presigner": "^3.1131.0",
+    "@google/genai": "^2.22.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.4",
     "@nestjs/core": "^11.0.1",
@@ -43,6 +46,7 @@
     "bcrypt": "^6.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "cookie": "^2.0.1",
     "cookie-parser": "^1.4.7",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
@@ -89,8 +93,19 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
+      "node_modules/(@nestjs/(jwt|passport)|cookie)/.+\\.js$": [
+        "ts-jest",
+        {
+          "tsconfig": {
+            "module": "commonjs"
+          }
+        }
+      ],
       "^.+\\.(t|j)s$": "ts-jest"
     },
+    "transformIgnorePatterns": [
+      "/node_modules/(?!(@nestjs/(jwt|passport)|cookie)/)"
+    ],
     "collectCoverageFrom": [
       "**/*.(t|j)s"
     ],

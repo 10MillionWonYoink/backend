@@ -8,6 +8,7 @@ import {
   Req,
   Res,
   UseGuards,
+  HttpStatus,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type {
@@ -100,7 +101,7 @@ export class AuthController {
       path: '/',
     });
 
-    response.status(200).json({
+    response.status(HttpStatus.OK).json({
       message: '회원가입이 완료되었습니다.',
       user: {
         id: user.id,
@@ -111,7 +112,7 @@ export class AuthController {
   }
 
   @Post('refresh')
-  @HttpCode(200)
+  @HttpCode(HttpStatus.OK)
   async refresh(
     @Req()
     request: ExpressRequest,
